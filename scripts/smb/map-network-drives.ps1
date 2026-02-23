@@ -20,7 +20,7 @@ $SmbUser = "jordan"
 $Drives = @(
     @{ Letter = "S"; Host = $SullivanHost; Share = "media";       Label = "Sullivan Media" }
     @{ Letter = "T"; Host = $SullivanHost; Share = "local-media"; Label = "Sullivan Local" }
-    @{ Letter = "F"; Host = $FreddyHost;   Share = "storage";     Label = "Freddy Storage" }
+    @{ Letter = "I"; Host = $FreddyHost;   Share = "storage";     Label = "Freddy Storage" }
     @{ Letter = "H"; Host = $FreddyHost;   Share = "local-media"; Label = "Freddy Local" }
 )
 
