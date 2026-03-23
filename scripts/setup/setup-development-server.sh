@@ -3,7 +3,8 @@
 # Development Server Setup Script
 # Targets: Ubuntu 25.10 (Questing Quetzal) — x86_64 / ARM64
 # Includes: Rust, Python 3.13 + ruff/mypy/uv, Docker Engine,
-#           NVIDIA Container Toolkit (CUDA), Zed IDE, full dev toolchain
+#           NVIDIA Container Toolkit (CUDA), Zed IDE, full dev toolchain,
+#           protoc (GitHub releases), buf CLI, protoc-gen-prost/tonic
 # =============================================================================
 #
 # Usage:
@@ -18,6 +19,7 @@
 #   --skip-languages        Skip programming language runtimes
 #   --skip-gui              Skip GUI applications (only install CLI tools)
 #   --skip-cuda             Skip NVIDIA/CUDA container toolkit
+#   --skip-proto            Skip protoc, buf CLI, and Rust protobuf plugins
 #   --minimal               Minimal install (Docker + essential tools only)
 #   --full                  Full install (all tools and languages)
 #   --no-confirm            Skip confirmation prompts
@@ -37,6 +39,7 @@ SKIP_DEVTOOLS=false
 SKIP_LANGUAGES=false
 SKIP_GUI=false
 SKIP_CUDA=false
+SKIP_PROTO=false
 MINIMAL_INSTALL=false
 FULL_INSTALL=false
 NO_CONFIRM=false
@@ -45,8 +48,10 @@ IS_WSL2=false
 
 # Pinned versions — update these as new releases ship
 PYTHON_VERSION="3.13"
-NVM_VERSION="v0.40.1"
-GO_VERSION="1.24.1"
+NVM_VERSION="v0.40.4"
+GO_VERSION="1.26.1"
+PROTOC_VERSION="34.1"   # https://github.com/protocolbuffers/protobuf/releases
+BUF_VERSION="1.66.1"    # https://github.com/bufbuild/buf/releases
 
 # =============================================================================
 # Colors and Logging
@@ -98,6 +103,7 @@ OPTIONS:
     --skip-languages        Skip language runtimes
     --skip-gui              Skip Zed IDE and other GUI apps
     --skip-cuda             Skip NVIDIA Container Toolkit / CUDA setup
+    --skip-proto            Skip protoc, buf CLI, and Rust protobuf plugins
     --minimal               Docker + essential CLI only
     --full                  Everything (default)
     --no-confirm            Non-interactive / automation mode
@@ -113,6 +119,11 @@ WHAT GETS INSTALLED:
       Rust (via rustup, stable toolchain)
       Node.js LTS (via nvm)
       Go (latest stable)
+
+    Protobuf / gRPC:
+      protoc (Protocol Buffer compiler — GitHub releases, version-pinned)
+      buf CLI (Buf Build — GitHub releases, version-pinned)
+      protoc-gen-prost + protoc-gen-tonic (Rust codegen plugins via cargo)
 
     Docker:
       Docker Engine (official repo)
@@ -139,22 +150,24 @@ EOF
 # =============================================================================
 while [ $# -gt 0 ]; do
     case "$1" in
-        -u|--user)       DEV_USER="$2";   shift 2 ;;
-        -n|--name)       MACHINE_NAME="$2"; shift 2 ;;
-        --skip-docker)   SKIP_DOCKER=true;  shift ;;
-        --skip-devtools) SKIP_DEVTOOLS=true; shift ;;
+        -u|--user)        DEV_USER="$2";    shift 2 ;;
+        -n|--name)        MACHINE_NAME="$2"; shift 2 ;;
+        --skip-docker)    SKIP_DOCKER=true;  shift ;;
+        --skip-devtools)  SKIP_DEVTOOLS=true; shift ;;
         --skip-languages) SKIP_LANGUAGES=true; shift ;;
-        --skip-gui)      SKIP_GUI=true;    shift ;;
-        --skip-cuda)     SKIP_CUDA=true;   shift ;;
+        --skip-gui)       SKIP_GUI=true;    shift ;;
+        --skip-cuda)      SKIP_CUDA=true;   shift ;;
+        --skip-proto)     SKIP_PROTO=true;  shift ;;
         --minimal)
             MINIMAL_INSTALL=true
             SKIP_LANGUAGES=true
             SKIP_GUI=true
+            SKIP_PROTO=true
             shift
             ;;
-        --full)    FULL_INSTALL=true; shift ;;
-        --no-confirm) NO_CONFIRM=true; shift ;;
-        -h|--help) show_help ;;
+        --full)       FULL_INSTALL=true; shift ;;
+        --no-confirm) NO_CONFIRM=true;   shift ;;
+        -h|--help)    show_help ;;
         *)
             log_error "Unknown option: $1"
             log_info "Use -h or --help for usage information"
@@ -197,7 +210,6 @@ if ! id "$DEV_USER" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Only apt is supported — this script targets Ubuntu/Debian
 if ! command -v apt-get >/dev/null 2>&1; then
     log_error "This script requires apt-get (Ubuntu/Debian only)"
     exit 1
@@ -220,7 +232,6 @@ case "$ARCH" in
 esac
 log_info "Architecture: $ARCH ($ARCH_NORMALIZED)"
 
-# WSL detection
 if grep -qi microsoft /proc/version 2>/dev/null; then
     IS_WSL=true
     if grep -qi wsl2 /proc/version 2>/dev/null || [ -f /proc/sys/fs/binfmt_misc/WSLInterop ]; then
@@ -231,7 +242,6 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
     fi
 fi
 
-# OS info
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS_NAME="${NAME:-Unknown}"
@@ -245,7 +255,6 @@ else
     OS_CODENAME=""
 fi
 
-# NVIDIA GPU detection
 HAS_NVIDIA=false
 if lspci 2>/dev/null | grep -qi nvidia || ls /dev/nvidia* >/dev/null 2>&1; then
     HAS_NVIDIA=true
@@ -261,13 +270,13 @@ USER_HOME=$(eval echo "~$DEV_USER")
 
 log_info "Machine: $MACHINE_NAME | User: $DEV_USER | Home: $USER_HOME"
 
-# Summary
 printf "\n${BOLD}Install Plan:${NC}\n"
-printf "  Docker:            %s\n" "$([ "$SKIP_DOCKER"    = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Install${NC}")"
-printf "  Dev Tools:         %s\n" "$([ "$SKIP_DEVTOOLS"  = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Install${NC}")"
-printf "  Languages:         %s\n" "$([ "$SKIP_LANGUAGES" = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Python 3.13, Rust, Node, Go${NC}")"
-printf "  CUDA Toolkit:      %s\n" "$([ "$SKIP_CUDA"      = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Install (nvidia-container-toolkit)${NC}")"
-printf "  Zed IDE:           %s\n" "$([ "$SKIP_GUI"       = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Install${NC}")"
+printf "  Docker:            %s\n" "$([ "$SKIP_DOCKER"    = true ] && printf "${YELLOW}SKIP${NC}" || printf "${GREEN}Install${NC}")"
+printf "  Dev Tools:         %s\n" "$([ "$SKIP_DEVTOOLS"  = true ] && printf "${YELLOW}SKIP${NC}" || printf "${GREEN}Install${NC}")"
+printf "  Languages:         %s\n" "$([ "$SKIP_LANGUAGES" = true ] && printf "${YELLOW}SKIP${NC}" || printf "${GREEN}Python 3.13, Rust, Node, Go${NC}")"
+printf "  Proto / gRPC:      %s\n" "$([ "$SKIP_PROTO"     = true ] && printf "${YELLOW}SKIP${NC}" || printf "${GREEN}protoc ${PROTOC_VERSION}, buf ${BUF_VERSION}, prost+tonic${NC}")"
+printf "  CUDA Toolkit:      %s\n" "$([ "$SKIP_CUDA"      = true ] && printf "${YELLOW}SKIP${NC}" || printf "${GREEN}Install (nvidia-container-toolkit)${NC}")"
+printf "  Zed IDE:           %s\n" "$([ "$SKIP_GUI"       = true ] && printf "${YELLOW}SKIP${NC}" || printf "${GREEN}Install${NC}")"
 printf "\n"
 
 confirm "Continue with setup?" || { log_info "Setup cancelled"; exit 0; }
@@ -299,7 +308,6 @@ if [ "$SKIP_DEVTOOLS" = true ]; then
 else
     log_info "Installing core CLI tools..."
 
-    # bat is packaged as 'bat' on Ubuntu 23.10+ (not 'batcat')
     apt-get install -y \
         git \
         build-essential \
@@ -346,7 +354,6 @@ else
             curl \
             wget
 
-    # On some Ubuntu releases bat is still 'batcat' — create alias if needed
     if ! command -v bat >/dev/null 2>&1 && command -v batcat >/dev/null 2>&1; then
         mkdir -p "$USER_HOME/.local/bin"
         ln -sf "$(command -v batcat)" "$USER_HOME/.local/bin/bat"
@@ -356,7 +363,6 @@ else
 
     log_success "Core tools installed"
 
-    # --- Git configuration ---
     log_subheader "Git Configuration"
 
     CURRENT_GIT_NAME=$(run_as_user  "git config --global user.name"  2>/dev/null || echo "")
@@ -399,18 +405,13 @@ else
     else
         log_info "Installing Docker Engine (official repo)..."
 
-        # Remove any legacy packages that conflict
         apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
 
-        # Add Docker's official GPG key
         install -m 0755 -d /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
             | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         chmod a+r /etc/apt/keyrings/docker.gpg
 
-        # Add repository — use the codename if available, otherwise use 'plucky'
-        # Ubuntu 25.10 codename is 'questing'; adjust if Docker doesn't have it yet
-        # and fall back to the nearest supported release.
         DOCKER_CODENAME="${OS_CODENAME:-questing}"
         echo \
             "deb [arch=${ARCH_NORMALIZED} signed-by=/etc/apt/keyrings/docker.gpg] \
@@ -418,7 +419,6 @@ else
             > /etc/apt/sources.list.d/docker.list
 
         apt-get update || {
-            # If Docker repo doesn't carry 25.10 yet, fall back to 25.04 (plucky)
             log_warn "Docker repo may not carry ${DOCKER_CODENAME} yet — trying plucky fallback"
             sed -i "s/${DOCKER_CODENAME}/plucky/g" /etc/apt/sources.list.d/docker.list
             apt-get update
@@ -434,13 +434,11 @@ else
         log_success "Docker installed: $(docker --version)"
     fi
 
-    # Enable and start Docker (not needed inside WSL1; WSL2+systemd is fine)
     if [ "$IS_WSL" = false ] || [ "$IS_WSL2" = true ]; then
         systemctl enable docker 2>/dev/null || true
         systemctl start  docker 2>/dev/null || true
     fi
 
-    # Add user to docker group
     if ! groups "$DEV_USER" | grep -q docker 2>/dev/null; then
         usermod -aG docker "$DEV_USER"
         log_success "User '$DEV_USER' added to docker group"
@@ -449,18 +447,15 @@ else
         log_info "User '$DEV_USER' already in docker group"
     fi
 
-    # Docker Compose sanity check
     if docker compose version >/dev/null 2>&1; then
         log_success "Docker Compose: $(docker compose version)"
     else
         log_warn "Docker Compose plugin not available — check installation"
     fi
 
-    # --- Docker daemon config ---
     DOCKER_DAEMON_CONFIG="/etc/docker/daemon.json"
     mkdir -p /etc/docker
 
-    # Build the daemon config — will be updated again in CUDA step if needed
     if [ ! -f "$DOCKER_DAEMON_CONFIG" ]; then
         log_info "Writing Docker daemon config..."
         cat > "$DOCKER_DAEMON_CONFIG" <<'EOF'
@@ -494,7 +489,6 @@ if [ "$SKIP_CUDA" = true ]; then
 else
     log_info "Installing NVIDIA Container Toolkit..."
 
-    # Add NVIDIA container toolkit GPG key and repo
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
         | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 
@@ -507,17 +501,12 @@ else
 
     log_success "nvidia-container-toolkit installed"
 
-    # Configure Docker runtime for NVIDIA
     log_info "Configuring NVIDIA runtime for Docker..."
     nvidia-ctk runtime configure --runtime=docker
 
-    # Merge nvidia runtime into daemon.json
-    # nvidia-ctk writes to daemon.json; ensure our log and buildkit settings survive.
-    # Re-write with full config if the file was just created by nvidia-ctk.
     if grep -q '"runtimes"' "$DOCKER_DAEMON_CONFIG" 2>/dev/null; then
         log_info "NVIDIA runtime block already present in daemon.json"
     else
-        # nvidia-ctk should have added it; if not, add manually
         python3 - <<'PYEOF'
 import json, sys
 
@@ -551,14 +540,12 @@ PYEOF
     systemctl restart docker 2>/dev/null || true
     log_success "Docker daemon restarted with NVIDIA runtime"
 
-    # Quick smoke test
     log_info "Testing NVIDIA container runtime (nvidia-smi inside Docker)..."
     if docker run --rm --runtime=nvidia --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi 2>/dev/null; then
         log_success "CUDA container test passed"
     else
-        log_warn "CUDA container test failed — this is expected if NVIDIA drivers are not yet installed"
-        log_warn "Install drivers with: sudo ubuntu-drivers install"
-        log_warn "Then re-run the test: docker run --rm --runtime=nvidia --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi"
+        log_warn "CUDA container test failed — expected if NVIDIA drivers are not yet installed"
+        log_warn "Install drivers: sudo ubuntu-drivers install"
     fi
 fi
 
@@ -574,7 +561,6 @@ else
     # --- Python 3.13 ---
     log_subheader "Python ${PYTHON_VERSION}"
 
-    # Ubuntu 25.10 ships Python 3.13 in main — use deadsnakes as a fallback
     if python3.13 --version >/dev/null 2>&1; then
         log_info "Python 3.13 already present: $(python3.13 --version)"
     else
@@ -589,14 +575,12 @@ else
         log_success "Python 3.13 installed: $(python3.13 --version)"
     fi
 
-    # pip for 3.13
     if ! python3.13 -m pip --version >/dev/null 2>&1; then
         log_info "Bootstrapping pip for Python 3.13..."
         python3.13 -m ensurepip --upgrade 2>/dev/null || \
             curl -sS https://bootstrap.pypa.io/get-pip.py | python3.13
     fi
 
-    # pipx — isolated CLI tool installer
     if ! command -v pipx >/dev/null 2>&1; then
         apt-get install -y pipx 2>/dev/null || \
             python3.13 -m pip install --user pipx
@@ -606,13 +590,9 @@ else
         log_info "pipx already installed"
     fi
 
-    # Make ~/.local/bin visible for the rest of this script session.
-    # The installers (uv, ruff, pipx) drop binaries there, and without this
-    # the command -v checks below would all fail even though the tools are present.
     LOCAL_BIN="$USER_HOME/.local/bin"
     export PATH="$LOCAL_BIN:$PATH"
 
-    # uv — fast Python package/project manager (replaces pip/venv in new projects)
     if ! [ -f "$LOCAL_BIN/uv" ]; then
         log_info "Installing uv..."
         run_as_user "curl -LsSf https://astral.sh/uv/install.sh | sh"
@@ -621,7 +601,6 @@ else
         log_info "uv already installed"
     fi
 
-    # ruff — fast Python linter/formatter (replaces flake8/black)
     if ! [ -f "$LOCAL_BIN/ruff" ]; then
         log_info "Installing ruff..."
         run_as_user "curl -LsSf https://astral.sh/ruff/install.sh | sh"
@@ -630,18 +609,14 @@ else
         log_info "ruff already installed: $("$LOCAL_BIN/ruff" --version 2>/dev/null || echo '')"
     fi
 
-    # mypy — static type checker
-    # Must use pipx, not pip --user: Ubuntu 25.10 enforces PEP 668
-    # (externally-managed-environment) and will reject bare pip installs.
     if ! [ -f "$LOCAL_BIN/mypy" ]; then
         log_info "Installing mypy via pipx..."
         run_as_user "pipx install mypy"
-        log_success "mypy installed: $("$LOCAL_BIN/mypy" --version 2>/dev/null || echo 'installed')"
+        log_success "mypy installed"
     else
         log_info "mypy already installed: $("$LOCAL_BIN/mypy" --version 2>/dev/null || echo '')"
     fi
 
-    # Make python3 point to 3.13 for this user if it doesn't already
     PYTHON3_VER=$(python3 --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "")
     if [ "$PYTHON3_VER" != "3.13" ] && command -v update-alternatives >/dev/null 2>&1; then
         update-alternatives --install /usr/bin/python3 python3 "$(command -v python3.13)" 10
@@ -668,7 +643,6 @@ else
         fi
     fi
 
-    # Useful cargo tools
     log_info "Installing cargo utilities (cargo-watch, cargo-edit, cargo-expand)..."
     run_as_user "$USER_HOME/.cargo/bin/cargo install cargo-watch  2>/dev/null || true"
     run_as_user "$USER_HOME/.cargo/bin/cargo install cargo-edit   2>/dev/null || true"
@@ -717,9 +691,123 @@ else
 fi  # SKIP_LANGUAGES
 
 # =============================================================================
-# Step 6: Shell Configuration
+# Step 6: Protobuf / gRPC Toolchain
 # =============================================================================
-log_header "Step 6: Shell Configuration"
+log_header "Step 6: Protobuf / gRPC Toolchain"
+
+if [ "$SKIP_PROTO" = true ]; then
+    log_skip "Proto toolchain skipped (--skip-proto)"
+else
+    CARGO_BIN="$USER_HOME/.cargo/bin"
+    PROTOC_INSTALL_DIR="$USER_HOME/.local"
+    PROTOC_BIN="$PROTOC_INSTALL_DIR/bin/protoc"
+
+    # --- protoc ---
+    log_subheader "protoc ${PROTOC_VERSION}"
+
+    if [ -f "$PROTOC_BIN" ]; then
+        log_info "protoc already installed: $($PROTOC_BIN --version 2>/dev/null || echo 'installed')"
+    else
+        log_info "Installing protoc ${PROTOC_VERSION} from GitHub releases..."
+
+        # Map normalised arch to the release archive naming used by protoc
+        case "$ARCH_NORMALIZED" in
+            amd64) PB_ARCH="linux-x86_64"  ;;
+            arm64) PB_ARCH="linux-aarch_64" ;;
+            armv7) PB_ARCH="linux-x86_32"  ;;
+            *)     PB_ARCH="linux-x86_64"  ;;
+        esac
+
+        PB_ZIP="protoc-${PROTOC_VERSION}-${PB_ARCH}.zip"
+        PB_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PB_ZIP}"
+
+        log_info "Downloading ${PB_URL}..."
+        wget -q "$PB_URL" -O "/tmp/${PB_ZIP}"
+
+        # Extract bin/protoc and include/**/*.proto into ~/.local
+        # The include/ dir holds well-known protos (google/protobuf/*.proto)
+        # needed by build.rs / prost-build at compile time
+        run_as_user "mkdir -p ${PROTOC_INSTALL_DIR}"
+        run_as_user "unzip -o /tmp/${PB_ZIP} -d ${PROTOC_INSTALL_DIR} 'bin/protoc' 'include/*'"
+        chmod +x "$PROTOC_BIN"
+        chown "$DEV_USER:$DEV_USER" "$PROTOC_BIN"
+        rm "/tmp/${PB_ZIP}"
+
+        log_success "protoc installed: $($PROTOC_BIN --version 2>/dev/null || echo "${PROTOC_VERSION}")"
+    fi
+
+    # Persist PROTOC + PROTOC_INCLUDE env vars so Rust build.rs picks them up
+    # without needing extra configuration in each project
+    PROTO_INCLUDE_DIR="$PROTOC_INSTALL_DIR/include"
+    SHELL_RC_CHECK=""
+    [ -f "$USER_HOME/.zshrc"  ] && SHELL_RC_CHECK="$USER_HOME/.zshrc"
+    [ -z "$SHELL_RC_CHECK" ] && [ -f "$USER_HOME/.bashrc" ] && SHELL_RC_CHECK="$USER_HOME/.bashrc"
+
+    if [ -n "$SHELL_RC_CHECK" ] && ! grep -q "PROTOC=" "$SHELL_RC_CHECK" 2>/dev/null; then
+        printf '\n# protoc — used by Rust prost-build / tonic-build in build.rs\nexport PROTOC="%s"\nexport PROTOC_INCLUDE="%s"\n' \
+            "$PROTOC_BIN" "$PROTO_INCLUDE_DIR" >> "$SHELL_RC_CHECK"
+        chown "$DEV_USER:$DEV_USER" "$SHELL_RC_CHECK"
+        log_info "PROTOC env vars written to $SHELL_RC_CHECK"
+    fi
+
+    # --- buf ---
+    log_subheader "buf CLI ${BUF_VERSION}"
+
+    BUF_BIN="/usr/local/bin/buf"
+
+    if [ -f "$BUF_BIN" ]; then
+        log_info "buf already installed: $($BUF_BIN --version 2>/dev/null || echo 'installed')"
+    else
+        log_info "Installing buf ${BUF_VERSION} from GitHub releases..."
+
+        case "$ARCH_NORMALIZED" in
+            amd64) BUF_ARCH="Linux-x86_64" ;;
+            arm64) BUF_ARCH="Linux-arm64"  ;;
+            *)     BUF_ARCH="Linux-x86_64" ;;
+        esac
+
+        curl -sSL \
+            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-${BUF_ARCH}" \
+            -o "$BUF_BIN"
+        chmod +x "$BUF_BIN"
+
+        log_success "buf installed: $($BUF_BIN --version 2>/dev/null || echo "${BUF_VERSION}")"
+    fi
+
+    # --- protoc Rust plugins (prost + tonic) ---
+    log_subheader "Rust codegen plugins (protoc-gen-prost, protoc-gen-tonic)"
+
+    # These need Rust — warn and skip gracefully if cargo isn't present yet
+    if ! [ -f "${CARGO_BIN}/cargo" ]; then
+        log_warn "cargo not found at ${CARGO_BIN}/cargo — Rust may not be installed"
+        log_warn "Once Rust is installed, run:"
+        log_warn "  cargo install protoc-gen-prost protoc-gen-tonic"
+    else
+        if [ -f "${CARGO_BIN}/protoc-gen-prost" ]; then
+            log_info "protoc-gen-prost already installed"
+        else
+            log_info "Installing protoc-gen-prost..."
+            run_as_user "${CARGO_BIN}/cargo install protoc-gen-prost" && \
+                log_success "protoc-gen-prost installed" || \
+                log_warn "protoc-gen-prost failed — retry: cargo install protoc-gen-prost"
+        fi
+
+        if [ -f "${CARGO_BIN}/protoc-gen-tonic" ]; then
+            log_info "protoc-gen-tonic already installed"
+        else
+            log_info "Installing protoc-gen-tonic..."
+            run_as_user "${CARGO_BIN}/cargo install protoc-gen-tonic" && \
+                log_success "protoc-gen-tonic installed" || \
+                log_warn "protoc-gen-tonic failed — retry: cargo install protoc-gen-tonic"
+        fi
+    fi
+
+fi  # SKIP_PROTO
+
+# =============================================================================
+# Step 7: Shell Configuration
+# =============================================================================
+log_header "Step 7: Shell Configuration"
 
 CURRENT_SHELL=$(getent passwd "$DEV_USER" | cut -d: -f7)
 log_info "Current shell: $CURRENT_SHELL"
@@ -741,7 +829,6 @@ if command -v zsh >/dev/null 2>&1; then
     fi
 fi
 
-# Detect rc file
 SHELL_RC=""
 [ -f "$USER_HOME/.zshrc"  ] && SHELL_RC="$USER_HOME/.zshrc"
 [ -z "$SHELL_RC" ] && [ -f "$USER_HOME/.bashrc" ] && SHELL_RC="$USER_HOME/.bashrc"
@@ -796,9 +883,9 @@ RCEOF
 fi
 
 # =============================================================================
-# Step 7: Zed IDE
+# Step 8: Zed IDE
 # =============================================================================
-log_header "Step 7: Zed IDE"
+log_header "Step 8: Zed IDE"
 
 if [ "$SKIP_GUI" = true ]; then
     log_skip "Zed IDE skipped (--skip-gui)"
@@ -808,7 +895,6 @@ else
     else
         log_info "Installing Zed IDE..."
 
-        # Zed requires a few system libraries
         apt-get install -y \
             libvulkan1 \
             libxkbcommon-x11-0 \
@@ -821,29 +907,26 @@ else
             libice6 \
             2>/dev/null || true
 
-        # Official Zed installer (installs to ~/.local/bin/zed)
         run_as_user "curl -f https://zed.dev/install.sh | sh"
 
         if run_as_user "command -v zed" >/dev/null 2>&1; then
             ZED_VER=$(run_as_user "zed --version" 2>/dev/null || echo "installed")
             log_success "Zed installed: $ZED_VER"
         else
-            log_warn "Zed installer ran but 'zed' not found in PATH yet"
-            log_warn "Add ~/.local/bin to PATH and run: zed"
+            log_warn "Zed installer ran but 'zed' not found in PATH yet — add ~/.local/bin to PATH"
         fi
     fi
 
-    # WSL note
     if [ "$IS_WSL" = true ]; then
         log_info "In WSL2, Zed launches via WSLg — ensure WSLg is enabled in your Windows setup"
     fi
 fi
 
 # =============================================================================
-# Step 8: WSL2 Configuration
+# Step 9: WSL2 Configuration
 # =============================================================================
 if [ "$IS_WSL" = true ]; then
-    log_header "Step 8: WSL2 Configuration"
+    log_header "Step 9: WSL2 Configuration"
 
     apt-get install -y wslu 2>/dev/null || log_warn "wslu not available in this release"
 
@@ -884,9 +967,9 @@ WSLRC
 fi
 
 # =============================================================================
-# Step 9: Development Directories
+# Step 10: Development Directories
 # =============================================================================
-log_header "Step 9: Development Directories"
+log_header "Step 10: Development Directories"
 
 for dir in dev projects github workspace tmp; do
     DIR_PATH="$USER_HOME/$dir"
@@ -899,9 +982,9 @@ for dir in dev projects github workspace tmp; do
 done
 
 # =============================================================================
-# Step 10: System Tuning
+# Step 11: System Tuning
 # =============================================================================
-log_header "Step 10: System Tuning"
+log_header "Step 11: System Tuning"
 
 SYSCTL_CONF="/etc/sysctl.d/99-devtools.conf"
 if [ ! -f "$SYSCTL_CONF" ]; then
@@ -920,12 +1003,9 @@ else
 fi
 
 # =============================================================================
-# Step 11: GitHub Sync Service (nuniesmith — all public repos)
-# Clones every public repo under ~/github, keeps them current via hourly pull,
-# and removes local dirs whose remote repo no longer exists.
-# Also prunes Docker images/volumes older than 7 days on each run.
+# Step 12: GitHub Sync Service (nuniesmith — all public repos)
 # =============================================================================
-log_header "Step 11: GitHub Repo Sync Service"
+log_header "Step 12: GitHub Repo Sync Service"
 
 GH_SYNC_SCRIPT="$USER_HOME/.local/bin/gh_sync.sh"
 GH_SYNC_SERVICE="github-sync"
@@ -933,13 +1013,10 @@ GH_SYNC_SERVICE="github-sync"
 mkdir -p "$USER_HOME/.local/bin"
 chown "$DEV_USER:$DEV_USER" "$USER_HOME/.local/bin"
 
-# --- Write the sync script ---
 log_info "Writing $GH_SYNC_SCRIPT..."
 cat > "$GH_SYNC_SCRIPT" << 'SYNCEOF'
 #!/bin/bash
 # GitHub repo sync — nuniesmith (all public repos)
-# Managed by setup-development-server.sh — edit carefully
-
 set -euo pipefail
 
 GH_USER="nuniesmith"
@@ -952,7 +1029,6 @@ log "--- Sync starting ---"
 mkdir -p "$TARGET_DIR"
 cd "$TARGET_DIR"
 
-# Fetch full repo list (handles >100 repos via pagination)
 log "Fetching repo list for $GH_USER..."
 REPO_DATA=""
 PAGE=1
@@ -974,7 +1050,6 @@ fi
 ACTIVE_REPOS=$(echo "$REPO_DATA" | cut -d'|' -f1 | sort)
 log "Found $(echo "$ACTIVE_REPOS" | grep -c .) repos"
 
-# Remove local dirs that no longer exist on GitHub
 for local_dir in */; do
     [ -d "$local_dir" ] || continue
     dir_name="${local_dir%/}"
@@ -984,17 +1059,14 @@ for local_dir in */; do
     fi
 done
 
-# Clone missing / pull existing
-CLONED=0
-PULLED=0
-FAILED=0
+CLONED=0; PULLED=0; FAILED=0
 while IFS='|' read -r REPO_NAME REPO_URL; do
     [ -z "$REPO_NAME" ] && continue
     if [ -d "$REPO_NAME/.git" ]; then
         if git -C "$REPO_NAME" pull --ff-only --quiet 2>/dev/null; then
             PULLED=$((PULLED + 1))
         else
-            log "WARN: ff-only pull failed for $REPO_NAME (diverged or dirty) — skipping"
+            log "WARN: ff-only pull failed for $REPO_NAME — skipping"
             FAILED=$((FAILED + 1))
         fi
     else
@@ -1010,7 +1082,6 @@ done <<< "$REPO_DATA"
 
 log "Sync complete — cloned=$CLONED pulled=$PULLED failed=$FAILED"
 
-# Docker maintenance — prune images/containers older than 7 days and orphaned volumes
 if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
     log "Running Docker prune (images/containers >7d, orphaned volumes)..."
     docker system prune -af --filter "until=168h" --quiet 2>/dev/null || true
@@ -1025,8 +1096,6 @@ chmod +x "$GH_SYNC_SCRIPT"
 chown "$DEV_USER:$DEV_USER" "$GH_SYNC_SCRIPT"
 log_success "Sync script written: $GH_SYNC_SCRIPT"
 
-# --- Systemd service unit ---
-log_info "Writing systemd service unit..."
 cat > "/etc/systemd/system/${GH_SYNC_SERVICE}.service" << SVCEOF
 [Unit]
 Description=Sync nuniesmith GitHub repos and prune Docker
@@ -1046,18 +1115,13 @@ StandardError=journal
 WantedBy=multi-user.target
 SVCEOF
 
-# --- Systemd timer unit ---
-log_info "Writing systemd timer unit..."
 cat > "/etc/systemd/system/${GH_SYNC_SERVICE}.timer" << TMREOF
 [Unit]
 Description=Hourly GitHub sync and Docker maintenance
 
 [Timer]
-# Run 2 minutes after boot (gives network time to settle)
 OnBootSec=2min
-# Then every hour
 OnUnitActiveSec=1h
-# Re-fire a missed run on next boot if the machine was off
 Persistent=true
 
 [Install]
@@ -1069,14 +1133,13 @@ systemctl enable --now "${GH_SYNC_SERVICE}.timer"
 
 if systemctl is-active --quiet "${GH_SYNC_SERVICE}.timer"; then
     log_success "github-sync timer enabled and active"
-    NEXT_RUN=$(systemctl show "${GH_SYNC_SERVICE}.timer" --property=NextElapseUSecRealtime --value 2>/dev/null || echo "")
     log_info "Next run: $(systemctl list-timers ${GH_SYNC_SERVICE}.timer --no-legend 2>/dev/null | awk '{print $1, $2}' || echo 'check: systemctl list-timers')"
 else
     log_warn "Timer may not be active yet — check: systemctl status ${GH_SYNC_SERVICE}.timer"
 fi
 
-log_info "Run manually anytime: ${CYAN}sudo -u ${DEV_USER} ${GH_SYNC_SCRIPT}${NC}"
-log_info "View logs:            ${CYAN}journalctl -u ${GH_SYNC_SERVICE}.service -f${NC}"
+log_info "Run manually: ${CYAN}sudo -u ${DEV_USER} ${GH_SYNC_SCRIPT}${NC}"
+log_info "View logs:    ${CYAN}journalctl -u ${GH_SYNC_SERVICE}.service -f${NC}"
 
 # =============================================================================
 # Done
@@ -1087,18 +1150,26 @@ printf "${BOLD}${GREEN}Environment ready on %s${NC}\n\n" "$MACHINE_NAME"
 
 printf "${BOLD}Installed:${NC}\n"
 [ "$SKIP_DEVTOOLS"  = false ] && printf "  ${GREEN}✓${NC} Core CLI tools\n"
-[ "$SKIP_DOCKER"    = false ] && command -v docker  >/dev/null 2>&1 && \
+[ "$SKIP_DOCKER"    = false ] && command -v docker >/dev/null 2>&1 && \
     printf "  ${GREEN}✓${NC} Docker %s + Compose\n" "$(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 [ "$SKIP_CUDA"      = false ] && \
-    printf "  ${GREEN}✓${NC} NVIDIA Container Toolkit (nvidia-container-toolkit)\n"
+    printf "  ${GREEN}✓${NC} NVIDIA Container Toolkit\n"
 if [ "$SKIP_LANGUAGES" = false ]; then
-    python3.13 --version  >/dev/null 2>&1 && \
+    python3.13 --version >/dev/null 2>&1 && \
         printf "  ${GREEN}✓${NC} Python 3.13 + uv + ruff + mypy\n"
     run_as_user "command -v rustc" >/dev/null 2>&1 && \
         printf "  ${GREEN}✓${NC} Rust %s (stable)\n" "$(run_as_user 'rustc --version' 2>/dev/null | cut -d' ' -f2)"
     printf "  ${GREEN}✓${NC} Node.js LTS (nvm)\n"
     command -v go >/dev/null 2>&1 && \
         printf "  ${GREEN}✓${NC} Go %s\n" "$(go version | cut -d' ' -f3)"
+fi
+if [ "$SKIP_PROTO" = false ]; then
+    [ -f "$USER_HOME/.local/bin/protoc" ] && \
+        printf "  ${GREEN}✓${NC} protoc %s\n" "$PROTOC_VERSION"
+    command -v buf >/dev/null 2>&1 && \
+        printf "  ${GREEN}✓${NC} buf %s\n" "$BUF_VERSION"
+    [ -f "$USER_HOME/.cargo/bin/protoc-gen-prost" ] && \
+        printf "  ${GREEN}✓${NC} protoc-gen-prost + protoc-gen-tonic\n"
 fi
 [ "$SKIP_GUI" = false ] && run_as_user "command -v zed" >/dev/null 2>&1 && \
     printf "  ${GREEN}✓${NC} Zed IDE\n"
@@ -1109,15 +1180,17 @@ printf "\n${BOLD}${YELLOW}Next steps:${NC}\n"
 
 N=1
 [ "$SKIP_DOCKER" = false ] && \
-    printf "  ${GREEN}%d.${NC} ${CYAN}newgrp docker${NC}  (or log out/in for docker group)\n" "$N" && N=$((N+1))
+    printf "  ${GREEN}%d.${NC} ${CYAN}newgrp docker${NC}  (or log out/in)\n" "$N" && N=$((N+1))
 printf "  ${GREEN}%d.${NC} ${CYAN}source %s${NC}\n" "$N" "${SHELL_RC:-~/.bashrc}" && N=$((N+1))
 [ "$SKIP_DOCKER" = false ] && \
     printf "  ${GREEN}%d.${NC} ${CYAN}docker run hello-world${NC}\n" "$N" && N=$((N+1))
 [ "$SKIP_CUDA"   = false ] && \
     printf "  ${GREEN}%d.${NC} ${CYAN}docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi${NC}\n" "$N" && N=$((N+1))
-printf "  ${GREEN}%d.${NC} Check sync logs: ${CYAN}journalctl -u github-sync.service -f${NC}\n" "$N" && N=$((N+1))
-printf "  ${GREEN}%d.${NC} Trigger sync now: ${CYAN}sudo systemctl start github-sync.service${NC}\n" "$N" && N=$((N+1))
-[ "$IS_WSL"      = true  ] && \
+[ "$SKIP_PROTO"  = false ] && \
+    printf "  ${GREEN}%d.${NC} Verify: ${CYAN}protoc --version && buf --version${NC}\n" "$N" && N=$((N+1))
+printf "  ${GREEN}%d.${NC} Sync logs: ${CYAN}journalctl -u github-sync.service -f${NC}\n" "$N" && N=$((N+1))
+printf "  ${GREEN}%d.${NC} Trigger sync: ${CYAN}sudo systemctl start github-sync.service${NC}\n" "$N" && N=$((N+1))
+[ "$IS_WSL" = true ] && \
     printf "  ${GREEN}%d.${NC} Restart WSL: ${CYAN}wsl --shutdown${NC} (from PowerShell)\n" "$N"
 
 printf "\n"
