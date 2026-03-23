@@ -606,8 +606,14 @@ else
         log_info "pipx already installed"
     fi
 
+    # Make ~/.local/bin visible for the rest of this script session.
+    # The installers (uv, ruff, pipx) drop binaries there, and without this
+    # the command -v checks below would all fail even though the tools are present.
+    LOCAL_BIN="$USER_HOME/.local/bin"
+    export PATH="$LOCAL_BIN:$PATH"
+
     # uv — fast Python package/project manager (replaces pip/venv in new projects)
-    if ! run_as_user "command -v uv" >/dev/null 2>&1; then
+    if ! [ -f "$LOCAL_BIN/uv" ]; then
         log_info "Installing uv..."
         run_as_user "curl -LsSf https://astral.sh/uv/install.sh | sh"
         log_success "uv installed"
@@ -616,22 +622,23 @@ else
     fi
 
     # ruff — fast Python linter/formatter (replaces flake8/black)
-    if ! run_as_user "command -v ruff" >/dev/null 2>&1; then
+    if ! [ -f "$LOCAL_BIN/ruff" ]; then
         log_info "Installing ruff..."
-        run_as_user "curl -LsSf https://astral.sh/ruff/install.sh | sh" 2>/dev/null || \
-            run_as_user "python3.13 -m pip install --user ruff"
+        run_as_user "curl -LsSf https://astral.sh/ruff/install.sh | sh"
         log_success "ruff installed"
     else
-        log_info "ruff already installed: $(run_as_user 'ruff --version' 2>/dev/null || echo '')"
+        log_info "ruff already installed: $("$LOCAL_BIN/ruff" --version 2>/dev/null || echo '')"
     fi
 
     # mypy — static type checker
-    if ! run_as_user "command -v mypy" >/dev/null 2>&1; then
-        log_info "Installing mypy..."
-        run_as_user "python3.13 -m pip install --user mypy"
-        log_success "mypy installed"
+    # Must use pipx, not pip --user: Ubuntu 25.10 enforces PEP 668
+    # (externally-managed-environment) and will reject bare pip installs.
+    if ! [ -f "$LOCAL_BIN/mypy" ]; then
+        log_info "Installing mypy via pipx..."
+        run_as_user "pipx install mypy"
+        log_success "mypy installed: $("$LOCAL_BIN/mypy" --version 2>/dev/null || echo 'installed')"
     else
-        log_info "mypy already installed"
+        log_info "mypy already installed: $("$LOCAL_BIN/mypy" --version 2>/dev/null || echo '')"
     fi
 
     # Make python3 point to 3.13 for this user if it doesn't already
