@@ -1,8 +1,9 @@
 #!/bin/sh
 # =============================================================================
 # Development Server Setup Script
-# A reusable script for setting up development workstations and WSL environments
-# Supports x86_64 and ARM64 architectures (including Apple Silicon)
+# Targets: Ubuntu 25.10 (Questing Quetzal) — x86_64 / ARM64
+# Includes: Rust, Python 3.13 + ruff/mypy/uv, Docker Engine,
+#           NVIDIA Container Toolkit (CUDA), Zed IDE, full dev toolchain
 # =============================================================================
 #
 # Usage:
@@ -16,15 +17,11 @@
 #   --skip-devtools         Skip development tools installation
 #   --skip-languages        Skip programming language runtimes
 #   --skip-gui              Skip GUI applications (only install CLI tools)
+#   --skip-cuda             Skip NVIDIA/CUDA container toolkit
 #   --minimal               Minimal install (Docker + essential tools only)
 #   --full                  Full install (all tools and languages)
 #   --no-confirm            Skip confirmation prompts
 #   -h, --help              Show this help message
-#
-# Examples:
-#   sudo ./setup-development-server.sh -u jordan
-#   sudo ./setup-development-server.sh --minimal
-#   sudo ./setup-development-server.sh --full --no-confirm
 #
 # =============================================================================
 
@@ -39,11 +36,17 @@ SKIP_DOCKER=false
 SKIP_DEVTOOLS=false
 SKIP_LANGUAGES=false
 SKIP_GUI=false
+SKIP_CUDA=false
 MINIMAL_INSTALL=false
 FULL_INSTALL=false
 NO_CONFIRM=false
 IS_WSL=false
 IS_WSL2=false
+
+# Pinned versions — update these as new releases ship
+PYTHON_VERSION="3.13"
+NVM_VERSION="v0.40.1"
+GO_VERSION="1.24.1"
 
 # =============================================================================
 # Colors and Logging
@@ -57,12 +60,12 @@ MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-log_info() { printf "${BLUE}[INFO]${NC} %s\n" "$*"; }
+log_info()    { printf "${BLUE}[INFO]${NC} %s\n"    "$*"; }
 log_success() { printf "${GREEN}[SUCCESS]${NC} %s\n" "$*"; }
-log_warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
-log_error() { printf "${RED}[ERROR]${NC} %s\n" "$*"; }
-log_step() { printf "${MAGENTA}[STEP]${NC} ${BOLD}%s${NC}\n" "$*"; }
-log_skip() { printf "${YELLOW}[SKIP]${NC} %s\n" "$*"; }
+log_warn()    { printf "${YELLOW}[WARN]${NC} %s\n"  "$*"; }
+log_error()   { printf "${RED}[ERROR]${NC} %s\n"   "$*"; }
+log_step()    { printf "${MAGENTA}[STEP]${NC} ${BOLD}%s${NC}\n" "$*"; }
+log_skip()    { printf "${YELLOW}[SKIP]${NC} %s\n"  "$*"; }
 
 log_header() {
     printf "\n"
@@ -77,84 +80,55 @@ log_subheader() {
 }
 
 # =============================================================================
-# Help Function
+# Help
 # =============================================================================
 show_help() {
     cat << 'EOF'
-Development Server Setup Script
-================================
-
-A reusable script for setting up development workstations and WSL environments.
-Optimized for Ubuntu/Debian on WSL, native Linux, and supports multiple architectures.
+Development Server Setup Script  (Ubuntu 25.10 edition)
+=======================================================
 
 USAGE:
     sudo ./setup-development-server.sh [OPTIONS]
 
 OPTIONS:
-    -u, --user NAME         Development user to configure
-                            (default: current user)
-
-    -n, --name NAME         Machine name/identifier for configuration
-                            (default: hostname)
-
-    --skip-docker           Skip Docker installation
-
-    --skip-devtools         Skip development tools (git, build-essential, etc.)
-
-    --skip-languages        Skip programming language runtimes (Node, Python, Go, etc.)
-
-    --skip-gui              Skip GUI applications (VS Code, browsers, etc.)
-                            Only install CLI tools
-
-    --minimal               Minimal install: Docker + essential CLI tools only
-                            Equivalent to: --skip-languages --skip-gui
-
-    --full                  Full install: All tools, languages, and applications
-                            (default behavior)
-
-    --no-confirm            Skip all confirmation prompts (for automation)
-
+    -u, --user NAME         Development user (default: current user)
+    -n, --name NAME         Machine name/identifier (default: hostname)
+    --skip-docker           Skip Docker Engine installation
+    --skip-devtools         Skip core CLI dev tools
+    --skip-languages        Skip language runtimes
+    --skip-gui              Skip Zed IDE and other GUI apps
+    --skip-cuda             Skip NVIDIA Container Toolkit / CUDA setup
+    --minimal               Docker + essential CLI only
+    --full                  Everything (default)
+    --no-confirm            Non-interactive / automation mode
     -h, --help              Show this help message
 
-EXAMPLES:
-    # Basic setup for current user
-    sudo ./setup-development-server.sh -u jordan
+WHAT GETS INSTALLED:
+    Core Tools:
+      git, curl, wget, build-essential, tmux, zsh, fzf, ripgrep,
+      fd-find, bat, jq, httpie, btop, ncdu, tree, tldr, etc.
 
-    # Minimal WSL setup (Docker + essentials)
-    sudo ./setup-development-server.sh --minimal
+    Languages:
+      Python 3.13 + pip + venv + pipx + uv + ruff + mypy
+      Rust (via rustup, stable toolchain)
+      Node.js LTS (via nvm)
+      Go (latest stable)
 
-    # Full automated setup
-    sudo ./setup-development-server.sh --full --no-confirm
+    Docker:
+      Docker Engine (official repo)
+      Docker Compose plugin
+      BuildKit enabled by default
 
-    # Skip GUI apps (headless/WSL)
-    sudo ./setup-development-server.sh --skip-gui
+    NVIDIA / CUDA:
+      nvidia-container-toolkit
+      Docker configured with nvidia runtime
+      (skipped if no NVIDIA GPU detected or --skip-cuda passed)
 
-WHAT THIS SCRIPT INSTALLS:
-    Core Development Tools:
-    - Git, curl, wget, build-essential
-    - tmux, vim, zsh (with oh-my-zsh optional)
-    - jq, httpie, btop/htop
-    - Docker and Docker Compose
+    GUI / IDE:
+      Zed IDE (https://zed.dev)
 
-    Programming Languages (unless --skip-languages):
-    - Node.js (via nvm)
-    - Python 3 + pip + venv
-    - Go (latest stable)
-    - Rust (via rustup)
-
-    Optional GUI Applications (unless --skip-gui):
-    - VS Code
-    - Google Chrome / Chromium
-
-    WSL-Specific:
-    - WSL utilities and integrations
-    - Windows interop optimizations
-
-SUPPORTED SYSTEMS:
-    - Ubuntu 22.04+ / Debian 11+
-    - WSL2 (Ubuntu 24.04, 25.10)
-    - Raspberry Pi OS (ARM64)
-    - x86_64 and ARM64 architectures
+    WSL2:
+      wsl.conf with systemd=true, Windows interop aliases
 
 EOF
     exit 0
@@ -165,47 +139,22 @@ EOF
 # =============================================================================
 while [ $# -gt 0 ]; do
     case "$1" in
-        -u|--user)
-            DEV_USER="$2"
-            shift 2
-            ;;
-        -n|--name)
-            MACHINE_NAME="$2"
-            shift 2
-            ;;
-        --skip-docker)
-            SKIP_DOCKER=true
-            shift
-            ;;
-        --skip-devtools)
-            SKIP_DEVTOOLS=true
-            shift
-            ;;
-        --skip-languages)
-            SKIP_LANGUAGES=true
-            shift
-            ;;
-        --skip-gui)
-            SKIP_GUI=true
-            shift
-            ;;
+        -u|--user)       DEV_USER="$2";   shift 2 ;;
+        -n|--name)       MACHINE_NAME="$2"; shift 2 ;;
+        --skip-docker)   SKIP_DOCKER=true;  shift ;;
+        --skip-devtools) SKIP_DEVTOOLS=true; shift ;;
+        --skip-languages) SKIP_LANGUAGES=true; shift ;;
+        --skip-gui)      SKIP_GUI=true;    shift ;;
+        --skip-cuda)     SKIP_CUDA=true;   shift ;;
         --minimal)
             MINIMAL_INSTALL=true
             SKIP_LANGUAGES=true
             SKIP_GUI=true
             shift
             ;;
-        --full)
-            FULL_INSTALL=true
-            shift
-            ;;
-        --no-confirm)
-            NO_CONFIRM=true
-            shift
-            ;;
-        -h|--help)
-            show_help
-            ;;
+        --full)    FULL_INSTALL=true; shift ;;
+        --no-confirm) NO_CONFIRM=true; shift ;;
+        -h|--help) show_help ;;
         *)
             log_error "Unknown option: $1"
             log_info "Use -h or --help for usage information"
@@ -215,502 +164,305 @@ while [ $# -gt 0 ]; do
 done
 
 # =============================================================================
-# Helper Functions
+# Helpers
 # =============================================================================
-
-# Detect package manager
-detect_package_manager() {
-    if command -v apt-get >/dev/null 2>&1; then
-        echo "apt"
-    elif command -v dnf >/dev/null 2>&1; then
-        echo "dnf"
-    elif command -v yum >/dev/null 2>&1; then
-        echo "yum"
-    elif command -v pacman >/dev/null 2>&1; then
-        echo "pacman"
-    elif command -v apk >/dev/null 2>&1; then
-        echo "apk"
-    elif command -v brew >/dev/null 2>&1; then
-        echo "brew"
-    else
-        echo "unknown"
-    fi
-}
-
-# Confirm prompt (skipped with --no-confirm)
 confirm() {
-    if [ "$NO_CONFIRM" = true ]; then
-        return 0
-    fi
+    [ "$NO_CONFIRM" = true ] && return 0
     printf "%s (Y/n) " "$1"
     read -r reply
-    case "$reply" in
-        n|N|no|No|NO)
-            return 1
-            ;;
-        *)
-            return 0
-            ;;
-    esac
+    case "$reply" in n|N|no|No|NO) return 1 ;; *) return 0 ;; esac
 }
 
-# Confirm prompt (default no)
 confirm_no() {
-    if [ "$NO_CONFIRM" = true ]; then
-        return 1
-    fi
+    [ "$NO_CONFIRM" = true ] && return 1
     printf "%s (y/N) " "$1"
     read -r reply
-    case "$reply" in
-        y|Y|yes|Yes|YES)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
+    case "$reply" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
-# Run command as dev user
 run_as_user() {
     sudo -u "$DEV_USER" -H sh -c "$*"
 }
 
 # =============================================================================
-# Pre-flight Checks
+# Pre-flight
 # =============================================================================
-
-# Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
     log_error "Please run this script with sudo"
     exit 1
 fi
 
-# Validate dev user exists
 if ! id "$DEV_USER" >/dev/null 2>&1; then
     log_error "User '$DEV_USER' does not exist"
     exit 1
 fi
 
+# Only apt is supported — this script targets Ubuntu/Debian
+if ! command -v apt-get >/dev/null 2>&1; then
+    log_error "This script requires apt-get (Ubuntu/Debian only)"
+    exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
 # =============================================================================
 # System Detection
 # =============================================================================
 log_header "Development Environment Setup"
-
 log_subheader "System Detection"
 
-# Detect architecture
 ARCH=$(uname -m)
-ARCH_NORMALIZED=""
 case "$ARCH" in
-    x86_64|amd64)
-        ARCH_NORMALIZED="amd64"
-        ;;
-    aarch64|arm64)
-        ARCH_NORMALIZED="arm64"
-        ;;
-    armv7l|armhf)
-        ARCH_NORMALIZED="armv7"
-        ;;
-    *)
-        ARCH_NORMALIZED="$ARCH"
-        ;;
+    x86_64|amd64)    ARCH_NORMALIZED="amd64" ;;
+    aarch64|arm64)   ARCH_NORMALIZED="arm64" ;;
+    armv7l|armhf)    ARCH_NORMALIZED="armv7" ;;
+    *)               ARCH_NORMALIZED="$ARCH" ;;
 esac
-
 log_info "Architecture: $ARCH ($ARCH_NORMALIZED)"
 
-# Detect WSL
+# WSL detection
 if grep -qi microsoft /proc/version 2>/dev/null; then
     IS_WSL=true
     if grep -qi wsl2 /proc/version 2>/dev/null || [ -f /proc/sys/fs/binfmt_misc/WSLInterop ]; then
         IS_WSL2=true
         log_success "WSL2 environment detected"
     else
-        log_warn "WSL1 environment detected (WSL2 recommended)"
+        log_warn "WSL1 detected — upgrade to WSL2 is strongly recommended"
     fi
 fi
 
-# Detect if Raspberry Pi
-IS_PI=false
-PI_MODEL=""
-if [ -f /proc/device-tree/model ]; then
-    PI_MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "")
-    if echo "$PI_MODEL" | grep -qi "raspberry"; then
-        IS_PI=true
-        log_success "Raspberry Pi detected: $PI_MODEL"
-    fi
-fi
-
-# Detect OS
+# OS info
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS_NAME="${NAME:-Unknown}"
     OS_VERSION="${VERSION_ID:-Unknown}"
-    OS_ID="${ID:-unknown}"
-    log_info "Operating System: $OS_NAME $OS_VERSION"
+    OS_CODENAME="${VERSION_CODENAME:-}"
+    log_info "OS: $OS_NAME $OS_VERSION ${OS_CODENAME:+(${OS_CODENAME})}"
 else
-    log_warn "Cannot detect OS version"
-    OS_NAME="Unknown"
-    OS_VERSION="Unknown"
-    OS_ID="unknown"
+    log_warn "Cannot read /etc/os-release"
+    OS_NAME="Ubuntu"
+    OS_VERSION="25.10"
+    OS_CODENAME=""
 fi
 
-# Detect package manager
-PKG_MANAGER=$(detect_package_manager)
-log_info "Package Manager: $PKG_MANAGER"
-
-# Get hostname
-HOSTNAME=$(hostname 2>/dev/null || echo "devmachine")
-if [ -z "$MACHINE_NAME" ]; then
-    MACHINE_NAME="$HOSTNAME"
+# NVIDIA GPU detection
+HAS_NVIDIA=false
+if lspci 2>/dev/null | grep -qi nvidia || ls /dev/nvidia* >/dev/null 2>&1; then
+    HAS_NVIDIA=true
+    log_success "NVIDIA GPU detected"
+else
+    log_info "No NVIDIA GPU detected — CUDA setup will be skipped unless --full is passed explicitly"
+    [ "$FULL_INSTALL" = false ] && SKIP_CUDA=true
 fi
-log_info "Machine Name: $MACHINE_NAME"
 
-# Get user home directory
+HOSTNAME_VAL=$(hostname 2>/dev/null || echo "devmachine")
+[ -z "$MACHINE_NAME" ] && MACHINE_NAME="$HOSTNAME_VAL"
 USER_HOME=$(eval echo "~$DEV_USER")
-log_info "User Home: $USER_HOME"
 
-# Show configuration
-printf "\n"
-printf "${BOLD}Configuration:${NC}\n"
-printf "  Development User: ${CYAN}%s${NC}\n" "$DEV_USER"
-printf "  Machine Name:     ${CYAN}%s${NC}\n" "$MACHINE_NAME"
-printf "  Install Type:     ${CYAN}%s${NC}\n" "$([ "$MINIMAL_INSTALL" = true ] && echo "Minimal" || echo "Standard")"
-printf "\n"
+log_info "Machine: $MACHINE_NAME | User: $DEV_USER | Home: $USER_HOME"
 
-# Show what will be installed
-printf "${BOLD}Components:${NC}\n"
-if [ "$SKIP_DOCKER" = true ]; then
-    printf "  Docker:           ${YELLOW}SKIP${NC}\n"
-else
-    printf "  Docker:           ${GREEN}Install${NC}\n"
-fi
-if [ "$SKIP_DEVTOOLS" = true ]; then
-    printf "  Dev Tools:        ${YELLOW}SKIP${NC}\n"
-else
-    printf "  Dev Tools:        ${GREEN}Install${NC}\n"
-fi
-if [ "$SKIP_LANGUAGES" = true ]; then
-    printf "  Languages:        ${YELLOW}SKIP${NC}\n"
-else
-    printf "  Languages:        ${GREEN}Install (Node, Python, Go, Rust)${NC}\n"
-fi
-if [ "$SKIP_GUI" = true ] || [ "$IS_WSL" = true ]; then
-    printf "  GUI Apps:         ${YELLOW}SKIP${NC}\n"
-else
-    printf "  GUI Apps:         ${GREEN}Install${NC}\n"
-fi
+# Summary
+printf "\n${BOLD}Install Plan:${NC}\n"
+printf "  Docker:            %s\n" "$([ "$SKIP_DOCKER"    = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Install${NC}")"
+printf "  Dev Tools:         %s\n" "$([ "$SKIP_DEVTOOLS"  = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Install${NC}")"
+printf "  Languages:         %s\n" "$([ "$SKIP_LANGUAGES" = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Python 3.13, Rust, Node, Go${NC}")"
+printf "  CUDA Toolkit:      %s\n" "$([ "$SKIP_CUDA"      = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Install (nvidia-container-toolkit)${NC}")"
+printf "  Zed IDE:           %s\n" "$([ "$SKIP_GUI"       = true ] && printf "${YELLOW}SKIP${NC}"    || printf "${GREEN}Install${NC}")"
 printf "\n"
 
-# Environment notes
-if [ "$IS_WSL2" = true ]; then
-    printf "${GREEN}✓${NC} WSL2 optimizations will be applied\n"
-elif [ "$IS_WSL" = true ]; then
-    printf "${YELLOW}⚠${NC} WSL1 detected - consider upgrading to WSL2\n"
-fi
-if [ "$IS_PI" = true ]; then
-    printf "${GREEN}✓${NC} Raspberry Pi optimizations will be applied\n"
-fi
-
-printf "\n"
-if ! confirm "Continue with setup?"; then
-    log_info "Setup cancelled"
-    exit 0
-fi
+confirm "Continue with setup?" || { log_info "Setup cancelled"; exit 0; }
 
 # =============================================================================
-# Step 1: Update System
+# Step 1: System Update
 # =============================================================================
 log_header "Step 1: System Update"
 
-case "$PKG_MANAGER" in
-    apt)
-        export DEBIAN_FRONTEND=noninteractive
-        log_info "Updating apt packages..."
-        apt-get update
-        apt-get upgrade -y
-        log_success "System updated (apt)"
-        ;;
-    dnf)
-        log_info "Updating dnf packages..."
-        dnf update -y
-        log_success "System updated (dnf)"
-        ;;
-    yum)
-        log_info "Updating yum packages..."
-        yum update -y
-        log_success "System updated (yum)"
-        ;;
-    pacman)
-        log_info "Updating pacman packages..."
-        pacman -Syu --noconfirm
-        log_success "System updated (pacman)"
-        ;;
-    brew)
-        log_info "Updating Homebrew..."
-        run_as_user "brew update"
-        log_success "Homebrew updated"
-        ;;
-    *)
-        log_error "Unsupported package manager: $PKG_MANAGER"
-        exit 1
-        ;;
-esac
+apt-get update
+apt-get upgrade -y
+apt-get install -y \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    apt-transport-https \
+    curl \
+    wget
+log_success "System updated"
 
 # =============================================================================
-# Step 2: Install Core Development Tools
+# Step 2: Core Development Tools
 # =============================================================================
 log_header "Step 2: Core Development Tools"
 
 if [ "$SKIP_DEVTOOLS" = true ]; then
-    log_skip "Development tools installation skipped"
+    log_skip "Dev tools skipped"
 else
-    case "$PKG_MANAGER" in
-        apt)
-            log_info "Installing development tools..."
-            apt-get install -y \
-                curl \
-                wget \
-                git \
-                build-essential \
-                ca-certificates \
-                gnupg \
-                lsb-release \
-                software-properties-common \
-                apt-transport-https \
-                vim \
-                nano \
-                tmux \
-                zsh \
-                htop \
-                btop \
-                jq \
-                httpie \
-                tree \
-                unzip \
-                zip \
-                openssh-client \
-                openssl \
-                net-tools \
-                dnsutils \
-                iputils-ping \
-                man-db \
-                tldr \
-                ncdu \
-                fzf \
-                ripgrep \
-                fd-find \
-                bat \
-                2>/dev/null || apt-get install -y \
-                curl \
-                wget \
-                git \
-                build-essential \
-                ca-certificates \
-                gnupg \
-                vim \
-                tmux \
-                zsh \
-                htop \
-                jq \
-                tree \
-                unzip \
-                zip \
-                openssh-client \
-                openssl
-            log_success "Development tools installed"
-            ;;
-        dnf|yum)
-            log_info "Installing development tools..."
-            $PKG_MANAGER install -y \
-                curl \
-                wget \
-                git \
-                gcc \
-                gcc-c++ \
-                make \
-                ca-certificates \
-                gnupg \
-                vim \
-                tmux \
-                zsh \
-                htop \
-                jq \
-                tree \
-                unzip \
-                zip \
-                openssh-clients \
-                openssl
-            log_success "Development tools installed"
-            ;;
-        pacman)
-            log_info "Installing development tools..."
-            pacman -S --noconfirm --needed \
-                curl \
-                wget \
-                git \
-                base-devel \
-                ca-certificates \
-                gnupg \
-                vim \
-                tmux \
-                zsh \
-                htop \
-                btop \
-                jq \
-                tree \
-                unzip \
-                zip \
-                openssh \
-                openssl
-            log_success "Development tools installed"
-            ;;
-        brew)
-            log_info "Installing development tools..."
-            run_as_user "brew install \
-                curl \
-                wget \
-                git \
-                vim \
-                tmux \
-                zsh \
-                htop \
-                btop \
-                jq \
-                httpie \
-                tree \
-                unzip \
-                fzf \
-                ripgrep \
-                fd \
-                bat"
-            log_success "Development tools installed"
-            ;;
-    esac
+    log_info "Installing core CLI tools..."
 
-    # Configure Git
+    # bat is packaged as 'bat' on Ubuntu 23.10+ (not 'batcat')
+    apt-get install -y \
+        git \
+        build-essential \
+        pkg-config \
+        libssl-dev \
+        libffi-dev \
+        vim \
+        nano \
+        tmux \
+        zsh \
+        htop \
+        btop \
+        jq \
+        httpie \
+        tree \
+        unzip \
+        zip \
+        openssh-client \
+        openssl \
+        net-tools \
+        dnsutils \
+        iputils-ping \
+        man-db \
+        ncdu \
+        fzf \
+        ripgrep \
+        fd-find \
+        bat \
+        tldr \
+        pciutils \
+        strace \
+        lsof \
+        2>/dev/null || apt-get install -y \
+            git \
+            build-essential \
+            vim \
+            tmux \
+            zsh \
+            htop \
+            jq \
+            tree \
+            unzip \
+            zip \
+            curl \
+            wget
+
+    # On some Ubuntu releases bat is still 'batcat' — create alias if needed
+    if ! command -v bat >/dev/null 2>&1 && command -v batcat >/dev/null 2>&1; then
+        mkdir -p "$USER_HOME/.local/bin"
+        ln -sf "$(command -v batcat)" "$USER_HOME/.local/bin/bat"
+        chown -R "$DEV_USER:$DEV_USER" "$USER_HOME/.local"
+        log_info "Created bat -> batcat symlink"
+    fi
+
+    log_success "Core tools installed"
+
+    # --- Git configuration ---
     log_subheader "Git Configuration"
 
-    CURRENT_GIT_NAME=$(run_as_user "git config --global user.name" 2>/dev/null || echo "")
+    CURRENT_GIT_NAME=$(run_as_user  "git config --global user.name"  2>/dev/null || echo "")
     CURRENT_GIT_EMAIL=$(run_as_user "git config --global user.email" 2>/dev/null || echo "")
 
-    if [ -z "$CURRENT_GIT_NAME" ]; then
-        log_info "Git user.name not set"
-        if [ "$NO_CONFIRM" = false ]; then
-            printf "Enter your name for Git commits: "
-            read -r GIT_NAME
-            if [ -n "$GIT_NAME" ]; then
-                run_as_user "git config --global user.name \"$GIT_NAME\""
-                log_success "Git user.name configured"
-            fi
-        fi
+    if [ -z "$CURRENT_GIT_NAME" ] && [ "$NO_CONFIRM" = false ]; then
+        printf "Name for Git commits: "
+        read -r GIT_NAME
+        [ -n "$GIT_NAME" ] && run_as_user "git config --global user.name \"$GIT_NAME\""
     else
-        log_info "Git user.name: $CURRENT_GIT_NAME"
+        log_info "Git user.name: ${CURRENT_GIT_NAME:-<not set>}"
     fi
 
-    if [ -z "$CURRENT_GIT_EMAIL" ]; then
-        log_info "Git user.email not set"
-        if [ "$NO_CONFIRM" = false ]; then
-            printf "Enter your email for Git commits: "
-            read -r GIT_EMAIL
-            if [ -n "$GIT_EMAIL" ]; then
-                run_as_user "git config --global user.email \"$GIT_EMAIL\""
-                log_success "Git user.email configured"
-            fi
-        fi
+    if [ -z "$CURRENT_GIT_EMAIL" ] && [ "$NO_CONFIRM" = false ]; then
+        printf "Email for Git commits: "
+        read -r GIT_EMAIL
+        [ -n "$GIT_EMAIL" ] && run_as_user "git config --global user.email \"$GIT_EMAIL\""
     else
-        log_info "Git user.email: $CURRENT_GIT_EMAIL"
+        log_info "Git user.email: ${CURRENT_GIT_EMAIL:-<not set>}"
     fi
 
-    # Set useful Git defaults
-    run_as_user "git config --global init.defaultBranch main" 2>/dev/null || true
-    run_as_user "git config --global pull.rebase false" 2>/dev/null || true
-    run_as_user "git config --global core.autocrlf input" 2>/dev/null || true
-    log_success "Git defaults configured"
+    run_as_user "git config --global init.defaultBranch main"    2>/dev/null || true
+    run_as_user "git config --global pull.rebase false"          2>/dev/null || true
+    run_as_user "git config --global core.autocrlf input"        2>/dev/null || true
+    run_as_user "git config --global core.editor vim"            2>/dev/null || true
+    run_as_user "git config --global rerere.enabled true"        2>/dev/null || true
+    log_success "Git configured"
 fi
 
 # =============================================================================
-# Step 3: Install Docker
+# Step 3: Docker Engine
 # =============================================================================
-log_header "Step 3: Docker Installation"
+log_header "Step 3: Docker Engine"
 
 if [ "$SKIP_DOCKER" = true ]; then
     log_skip "Docker installation skipped"
 else
     if command -v docker >/dev/null 2>&1; then
-        DOCKER_VERSION=$(docker --version 2>/dev/null || echo "unknown")
-        log_warn "Docker already installed: $DOCKER_VERSION"
+        log_warn "Docker already installed: $(docker --version)"
     else
-        log_info "Installing Docker..."
+        log_info "Installing Docker Engine (official repo)..."
 
-        if [ "$PKG_MANAGER" = "apt" ]; then
-            # Official Docker installation for Debian/Ubuntu
-            curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-            sh /tmp/get-docker.sh
-            rm -f /tmp/get-docker.sh
-        else
-            # Use package manager for other systems
-            case "$PKG_MANAGER" in
-                dnf|yum)
-                    $PKG_MANAGER install -y docker docker-compose
-                    ;;
-                pacman)
-                    pacman -S --noconfirm docker docker-compose
-                    ;;
-                brew)
-                    log_warn "Docker Desktop must be installed manually on macOS"
-                    log_info "Download from: https://www.docker.com/products/docker-desktop"
-                    ;;
-            esac
-        fi
+        # Remove any legacy packages that conflict
+        apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
 
-        log_success "Docker installed: $(docker --version 2>/dev/null || echo 'installation complete')"
+        # Add Docker's official GPG key
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+            | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+
+        # Add repository — use the codename if available, otherwise use 'plucky'
+        # Ubuntu 25.10 codename is 'questing'; adjust if Docker doesn't have it yet
+        # and fall back to the nearest supported release.
+        DOCKER_CODENAME="${OS_CODENAME:-questing}"
+        echo \
+            "deb [arch=${ARCH_NORMALIZED} signed-by=/etc/apt/keyrings/docker.gpg] \
+            https://download.docker.com/linux/ubuntu ${DOCKER_CODENAME} stable" \
+            > /etc/apt/sources.list.d/docker.list
+
+        apt-get update || {
+            # If Docker repo doesn't carry 25.10 yet, fall back to 25.04 (plucky)
+            log_warn "Docker repo may not carry ${DOCKER_CODENAME} yet — trying plucky fallback"
+            sed -i "s/${DOCKER_CODENAME}/plucky/g" /etc/apt/sources.list.d/docker.list
+            apt-get update
+        }
+
+        apt-get install -y \
+            docker-ce \
+            docker-ce-cli \
+            containerd.io \
+            docker-buildx-plugin \
+            docker-compose-plugin
+
+        log_success "Docker installed: $(docker --version)"
     fi
 
-    # Start and enable Docker (if not WSL1)
+    # Enable and start Docker (not needed inside WSL1; WSL2+systemd is fine)
     if [ "$IS_WSL" = false ] || [ "$IS_WSL2" = true ]; then
-        log_info "Enabling Docker service..."
-        systemctl start docker 2>/dev/null || true
         systemctl enable docker 2>/dev/null || true
-        log_success "Docker service enabled"
+        systemctl start  docker 2>/dev/null || true
     fi
 
     # Add user to docker group
     if ! groups "$DEV_USER" | grep -q docker 2>/dev/null; then
         usermod -aG docker "$DEV_USER"
         log_success "User '$DEV_USER' added to docker group"
-        log_warn "Logout and login again for docker group changes to take effect"
+        log_warn "Log out and back in (or run: newgrp docker) for group change to take effect"
     else
         log_info "User '$DEV_USER' already in docker group"
     fi
 
-    # Install Docker Compose plugin
-    if ! docker compose version >/dev/null 2>&1; then
-        log_info "Installing Docker Compose plugin..."
-
-        case "$PKG_MANAGER" in
-            apt)
-                apt-get install -y docker-compose-plugin 2>/dev/null || true
-                ;;
-            dnf|yum)
-                $PKG_MANAGER install -y docker-compose-plugin 2>/dev/null || true
-                ;;
-        esac
-
-        if docker compose version >/dev/null 2>&1; then
-            log_success "Docker Compose installed: $(docker compose version)"
-        else
-            log_warn "Docker Compose plugin not available, you may need to install it manually"
-        fi
+    # Docker Compose sanity check
+    if docker compose version >/dev/null 2>&1; then
+        log_success "Docker Compose: $(docker compose version)"
     else
-        log_info "Docker Compose already installed: $(docker compose version 2>/dev/null | head -n1)"
+        log_warn "Docker Compose plugin not available — check installation"
     fi
 
-    # Configure Docker daemon for development
+    # --- Docker daemon config ---
     DOCKER_DAEMON_CONFIG="/etc/docker/daemon.json"
+    mkdir -p /etc/docker
+
+    # Build the daemon config — will be updated again in CUDA step if needed
     if [ ! -f "$DOCKER_DAEMON_CONFIG" ]; then
-        log_info "Configuring Docker daemon..."
-        mkdir -p /etc/docker
+        log_info "Writing Docker daemon config..."
         cat > "$DOCKER_DAEMON_CONFIG" <<'EOF'
 {
   "log-driver": "json-file",
@@ -724,300 +476,381 @@ else
   }
 }
 EOF
-        systemctl restart docker 2>/dev/null || true
-        log_success "Docker daemon configured"
+        log_success "Docker daemon config written"
     else
-        log_info "Docker daemon already configured"
+        log_info "Docker daemon config already exists — leaving untouched"
+    fi
+
+    systemctl restart docker 2>/dev/null || true
+fi
+
+# =============================================================================
+# Step 4: NVIDIA Container Toolkit (CUDA)
+# =============================================================================
+log_header "Step 4: NVIDIA Container Toolkit (CUDA)"
+
+if [ "$SKIP_CUDA" = true ]; then
+    log_skip "CUDA / NVIDIA container toolkit skipped"
+else
+    log_info "Installing NVIDIA Container Toolkit..."
+
+    # Add NVIDIA container toolkit GPG key and repo
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+        | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+        | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+        > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+    apt-get update
+    apt-get install -y nvidia-container-toolkit
+
+    log_success "nvidia-container-toolkit installed"
+
+    # Configure Docker runtime for NVIDIA
+    log_info "Configuring NVIDIA runtime for Docker..."
+    nvidia-ctk runtime configure --runtime=docker
+
+    # Merge nvidia runtime into daemon.json
+    # nvidia-ctk writes to daemon.json; ensure our log and buildkit settings survive.
+    # Re-write with full config if the file was just created by nvidia-ctk.
+    if grep -q '"runtimes"' "$DOCKER_DAEMON_CONFIG" 2>/dev/null; then
+        log_info "NVIDIA runtime block already present in daemon.json"
+    else
+        # nvidia-ctk should have added it; if not, add manually
+        python3 - <<'PYEOF'
+import json, sys
+
+path = "/etc/docker/daemon.json"
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+
+cfg.setdefault("log-driver", "json-file")
+cfg.setdefault("log-opts", {"max-size": "10m", "max-file": "3"})
+cfg.setdefault("storage-driver", "overlay2")
+cfg.setdefault("features", {"buildkit": True})
+cfg.setdefault("default-runtime", "nvidia")
+cfg.setdefault("runtimes", {
+    "nvidia": {
+        "path": "nvidia-container-runtime",
+        "runtimeArgs": []
+    }
+})
+
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+
+print("daemon.json updated with nvidia runtime")
+PYEOF
+    fi
+
+    systemctl restart docker 2>/dev/null || true
+    log_success "Docker daemon restarted with NVIDIA runtime"
+
+    # Quick smoke test
+    log_info "Testing NVIDIA container runtime (nvidia-smi inside Docker)..."
+    if docker run --rm --runtime=nvidia --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi 2>/dev/null; then
+        log_success "CUDA container test passed"
+    else
+        log_warn "CUDA container test failed — this is expected if NVIDIA drivers are not yet installed"
+        log_warn "Install drivers with: sudo ubuntu-drivers install"
+        log_warn "Then re-run the test: docker run --rm --runtime=nvidia --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi"
     fi
 fi
 
 # =============================================================================
-# Step 4: Install Programming Languages
+# Step 5: Programming Languages
 # =============================================================================
-log_header "Step 4: Programming Languages"
+log_header "Step 5: Programming Languages"
 
 if [ "$SKIP_LANGUAGES" = true ]; then
-    log_skip "Programming languages installation skipped"
+    log_skip "Language runtimes skipped"
 else
-    # Node.js (via nvm)
-    log_subheader "Node.js (via nvm)"
+
+    # --- Python 3.13 ---
+    log_subheader "Python ${PYTHON_VERSION}"
+
+    # Ubuntu 25.10 ships Python 3.13 in main — use deadsnakes as a fallback
+    if python3.13 --version >/dev/null 2>&1; then
+        log_info "Python 3.13 already present: $(python3.13 --version)"
+    else
+        log_info "Adding deadsnakes PPA for Python 3.13..."
+        add-apt-repository -y ppa:deadsnakes/ppa
+        apt-get update
+        apt-get install -y \
+            python3.13 \
+            python3.13-dev \
+            python3.13-venv \
+            python3.13-distutils 2>/dev/null || true
+        log_success "Python 3.13 installed: $(python3.13 --version)"
+    fi
+
+    # pip for 3.13
+    if ! python3.13 -m pip --version >/dev/null 2>&1; then
+        log_info "Bootstrapping pip for Python 3.13..."
+        python3.13 -m ensurepip --upgrade 2>/dev/null || \
+            curl -sS https://bootstrap.pypa.io/get-pip.py | python3.13
+    fi
+
+    # pipx — isolated CLI tool installer
+    if ! command -v pipx >/dev/null 2>&1; then
+        apt-get install -y pipx 2>/dev/null || \
+            python3.13 -m pip install --user pipx
+        run_as_user "python3.13 -m pipx ensurepath"
+        log_success "pipx installed"
+    else
+        log_info "pipx already installed"
+    fi
+
+    # Make ~/.local/bin visible for the rest of this script session.
+    # The installers (uv, ruff, pipx) drop binaries there, and without this
+    # the command -v checks below would all fail even though the tools are present.
+    LOCAL_BIN="$USER_HOME/.local/bin"
+    export PATH="$LOCAL_BIN:$PATH"
+
+    # uv — fast Python package/project manager (replaces pip/venv in new projects)
+    if ! [ -f "$LOCAL_BIN/uv" ]; then
+        log_info "Installing uv..."
+        run_as_user "curl -LsSf https://astral.sh/uv/install.sh | sh"
+        log_success "uv installed"
+    else
+        log_info "uv already installed"
+    fi
+
+    # ruff — fast Python linter/formatter (replaces flake8/black)
+    if ! [ -f "$LOCAL_BIN/ruff" ]; then
+        log_info "Installing ruff..."
+        run_as_user "curl -LsSf https://astral.sh/ruff/install.sh | sh"
+        log_success "ruff installed"
+    else
+        log_info "ruff already installed: $("$LOCAL_BIN/ruff" --version 2>/dev/null || echo '')"
+    fi
+
+    # mypy — static type checker
+    # Must use pipx, not pip --user: Ubuntu 25.10 enforces PEP 668
+    # (externally-managed-environment) and will reject bare pip installs.
+    if ! [ -f "$LOCAL_BIN/mypy" ]; then
+        log_info "Installing mypy via pipx..."
+        run_as_user "pipx install mypy"
+        log_success "mypy installed: $("$LOCAL_BIN/mypy" --version 2>/dev/null || echo 'installed')"
+    else
+        log_info "mypy already installed: $("$LOCAL_BIN/mypy" --version 2>/dev/null || echo '')"
+    fi
+
+    # Make python3 point to 3.13 for this user if it doesn't already
+    PYTHON3_VER=$(python3 --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "")
+    if [ "$PYTHON3_VER" != "3.13" ] && command -v update-alternatives >/dev/null 2>&1; then
+        update-alternatives --install /usr/bin/python3 python3 "$(command -v python3.13)" 10
+        log_info "python3 -> python3.13 set via update-alternatives"
+    fi
+
+    log_success "Python stack ready"
+
+    # --- Rust ---
+    log_subheader "Rust (rustup)"
+
+    if run_as_user "command -v rustc" >/dev/null 2>&1; then
+        log_info "Rust already installed: $(run_as_user 'rustc --version')"
+        run_as_user "$USER_HOME/.cargo/bin/rustup update stable" 2>/dev/null || true
+    else
+        log_info "Installing Rust via rustup..."
+        run_as_user "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --default-toolchain stable"
+
+        CARGO_ENV="$USER_HOME/.cargo/env"
+        if [ -f "$CARGO_ENV" ]; then
+            . "$CARGO_ENV"
+            log_success "Rust installed: $(rustc --version 2>/dev/null || echo 'stable')"
+        fi
+    fi
+
+    # Useful cargo tools
+    log_info "Installing cargo utilities (cargo-watch, cargo-edit, cargo-expand)..."
+    run_as_user "$USER_HOME/.cargo/bin/cargo install cargo-watch  2>/dev/null || true"
+    run_as_user "$USER_HOME/.cargo/bin/cargo install cargo-edit   2>/dev/null || true"
+    run_as_user "$USER_HOME/.cargo/bin/cargo install cargo-expand 2>/dev/null || true"
+    log_success "Cargo utilities installed"
+
+    # --- Node.js via nvm ---
+    log_subheader "Node.js (nvm ${NVM_VERSION})"
 
     NVM_DIR="$USER_HOME/.nvm"
     if [ -d "$NVM_DIR" ]; then
         log_warn "nvm already installed"
     else
-        log_info "Installing nvm..."
-        NVM_VERSION="v0.39.7"
-        run_as_user "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_VERSION/install.sh | bash"
+        log_info "Installing nvm ${NVM_VERSION}..."
+        run_as_user "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/${NVM_VERSION}/install.sh | bash"
         log_success "nvm installed"
     fi
 
-    # Install latest LTS Node.js
-    if [ -d "$NVM_DIR" ]; then
-        log_info "Installing Node.js LTS..."
-        run_as_user ". $NVM_DIR/nvm.sh && nvm install --lts && nvm use --lts"
-        NODE_VERSION=$(run_as_user ". $NVM_DIR/nvm.sh && node --version" 2>/dev/null || echo "")
-        if [ -n "$NODE_VERSION" ]; then
-            log_success "Node.js installed: $NODE_VERSION"
-        fi
-    fi
+    log_info "Installing Node.js LTS..."
+    run_as_user ". ${NVM_DIR}/nvm.sh && nvm install --lts && nvm use --lts && nvm alias default node"
+    NODE_VER=$(run_as_user ". ${NVM_DIR}/nvm.sh && node --version" 2>/dev/null || echo "")
+    [ -n "$NODE_VER" ] && log_success "Node.js installed: $NODE_VER"
 
-    # Python
-    log_subheader "Python"
-
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON_VERSION=$(python3 --version 2>/dev/null || echo "unknown")
-        log_info "Python already installed: $PYTHON_VERSION"
-    else
-        log_info "Installing Python..."
-        case "$PKG_MANAGER" in
-            apt)
-                apt-get install -y python3 python3-pip python3-venv python3-dev
-                ;;
-            dnf|yum)
-                $PKG_MANAGER install -y python3 python3-pip python3-virtualenv
-                ;;
-            pacman)
-                pacman -S --noconfirm python python-pip
-                ;;
-            brew)
-                run_as_user "brew install python3"
-                ;;
-        esac
-        log_success "Python installed: $(python3 --version 2>/dev/null || echo 'complete')"
-    fi
-
-    # Upgrade pip
-    log_info "Upgrading pip..."
-    run_as_user "python3 -m pip install --user --upgrade pip setuptools wheel" 2>/dev/null || true
-
-    # Go
-    log_subheader "Go"
+    # --- Go ---
+    log_subheader "Go ${GO_VERSION}"
 
     if command -v go >/dev/null 2>&1; then
-        GO_VERSION=$(go version 2>/dev/null || echo "unknown")
-        log_info "Go already installed: $GO_VERSION"
+        log_info "Go already installed: $(go version)"
     else
-        log_info "Installing Go..."
-
-        GO_VERSION="1.22.0"
-        GO_ARCH="$ARCH_NORMALIZED"
-        if [ "$GO_ARCH" = "amd64" ]; then
-            GO_ARCH="amd64"
-        elif [ "$GO_ARCH" = "arm64" ]; then
-            GO_ARCH="arm64"
-        fi
-
-        GO_TAR="go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
+        log_info "Installing Go ${GO_VERSION}..."
+        GO_TAR="go${GO_VERSION}.linux-${ARCH_NORMALIZED}.tar.gz"
         GO_URL="https://go.dev/dl/${GO_TAR}"
-
-        wget -q "$GO_URL" -O /tmp/"$GO_TAR" 2>/dev/null || curl -fsSL "$GO_URL" -o /tmp/"$GO_TAR"
+        wget -q "$GO_URL" -O "/tmp/${GO_TAR}"
         rm -rf /usr/local/go
-        tar -C /usr/local -xzf /tmp/"$GO_TAR"
-        rm /tmp/"$GO_TAR"
+        tar -C /usr/local -xzf "/tmp/${GO_TAR}"
+        rm "/tmp/${GO_TAR}"
 
-        # Add to PATH
         if ! grep -q '/usr/local/go/bin' "$USER_HOME/.profile" 2>/dev/null; then
-            echo 'export PATH=$PATH:/usr/local/go/bin' >> "$USER_HOME/.profile"
-            echo 'export PATH=$PATH:$HOME/go/bin' >> "$USER_HOME/.profile"
+            printf '\nexport PATH=$PATH:/usr/local/go/bin\nexport PATH=$PATH:$HOME/go/bin\n' \
+                >> "$USER_HOME/.profile"
         fi
-
         export PATH=$PATH:/usr/local/go/bin
-        log_success "Go installed: $(go version 2>/dev/null || echo "$GO_VERSION")"
+        log_success "Go installed: $(go version)"
     fi
 
-    # Rust
-    log_subheader "Rust"
-
-    if command -v rustc >/dev/null 2>&1; then
-        RUST_VERSION=$(rustc --version 2>/dev/null || echo "unknown")
-        log_info "Rust already installed: $RUST_VERSION"
-    else
-        log_info "Installing Rust..."
-        run_as_user "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path"
-
-        # Add to PATH
-        CARGO_ENV="$USER_HOME/.cargo/env"
-        if [ -f "$CARGO_ENV" ]; then
-            . "$CARGO_ENV"
-            RUST_VERSION=$(rustc --version 2>/dev/null || echo "installed")
-            log_success "Rust installed: $RUST_VERSION"
-        fi
-    fi
-fi
+fi  # SKIP_LANGUAGES
 
 # =============================================================================
-# Step 5: Shell Configuration
+# Step 6: Shell Configuration
 # =============================================================================
-log_header "Step 5: Shell Configuration"
+log_header "Step 6: Shell Configuration"
 
-# Detect current shell
 CURRENT_SHELL=$(getent passwd "$DEV_USER" | cut -d: -f7)
 log_info "Current shell: $CURRENT_SHELL"
 
-# Offer zsh installation
-if [ "$SKIP_DEVTOOLS" = false ]; then
-    if command -v zsh >/dev/null 2>&1; then
-        if [ "$CURRENT_SHELL" != "$(command -v zsh)" ]; then
-            if [ "$NO_CONFIRM" = false ]; then
-                if confirm_no "Change default shell to zsh?"; then
-                    chsh -s "$(command -v zsh)" "$DEV_USER"
-                    log_success "Default shell changed to zsh"
+if command -v zsh >/dev/null 2>&1; then
+    ZSH_PATH=$(command -v zsh)
+    if [ "$CURRENT_SHELL" != "$ZSH_PATH" ] && [ "$NO_CONFIRM" = false ]; then
+        if confirm_no "Switch default shell to zsh?"; then
+            chsh -s "$ZSH_PATH" "$DEV_USER"
+            log_success "Default shell -> zsh"
 
-                    # Offer oh-my-zsh
-                    if [ ! -d "$USER_HOME/.oh-my-zsh" ]; then
-                        if confirm_no "Install oh-my-zsh?"; then
-                            run_as_user 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
-                            log_success "oh-my-zsh installed"
-                        fi
-                    fi
-                fi
+            if [ ! -d "$USER_HOME/.oh-my-zsh" ] && confirm_no "Install oh-my-zsh?"; then
+                run_as_user 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended'
+                log_success "oh-my-zsh installed"
             fi
-        else
-            log_info "zsh is already the default shell"
         fi
+    else
+        log_info "zsh is already the default shell"
     fi
 fi
 
-# Create useful shell aliases
-log_subheader "Shell Aliases"
-
+# Detect rc file
 SHELL_RC=""
-if [ -f "$USER_HOME/.zshrc" ]; then
-    SHELL_RC="$USER_HOME/.zshrc"
-elif [ -f "$USER_HOME/.bashrc" ]; then
-    SHELL_RC="$USER_HOME/.bashrc"
-fi
+[ -f "$USER_HOME/.zshrc"  ] && SHELL_RC="$USER_HOME/.zshrc"
+[ -z "$SHELL_RC" ] && [ -f "$USER_HOME/.bashrc" ] && SHELL_RC="$USER_HOME/.bashrc"
 
-if [ -n "$SHELL_RC" ]; then
-    if ! grep -q "# Development aliases" "$SHELL_RC" 2>/dev/null; then
-        log_info "Adding development aliases..."
-        cat >> "$SHELL_RC" <<'EOF'
+if [ -n "$SHELL_RC" ] && ! grep -q "# Dev environment aliases" "$SHELL_RC" 2>/dev/null; then
+    log_info "Appending dev aliases to $SHELL_RC..."
+    cat >> "$SHELL_RC" <<'RCEOF'
 
-# Development aliases
+# Dev environment aliases
 alias ll='ls -lah'
 alias la='ls -A'
 alias l='ls -CF'
 alias ..='cd ..'
 alias ...='cd ../..'
+
+# Git
 alias gs='git status'
 alias gp='git pull'
 alias gc='git commit'
 alias gd='git diff'
 alias gl='git log --oneline --graph --decorate'
+alias gco='git checkout'
+alias gb='git branch'
+
+# Docker
 alias dc='docker compose'
-alias dps='docker ps'
+alias dps='docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"'
 alias dimg='docker images'
-alias dlog='docker logs'
+alias dlog='docker logs -f'
+alias dexec='docker exec -it'
+alias dprune='docker system prune -af'
 
 # Python
-alias py='python3'
-alias venv='python3 -m venv'
+alias py='python3.13'
+alias venv='python3.13 -m venv'
+alias activate='source .venv/bin/activate'
 
-# Quick navigation
+# uv shortcuts
+alias uvr='uv run'
+alias uvs='uv sync'
+
+# Navigation
 alias dev='cd ~/dev'
 alias proj='cd ~/projects'
 
-EOF
-        chown "$DEV_USER:$DEV_USER" "$SHELL_RC"
-        log_success "Shell aliases added"
-    else
-        log_info "Shell aliases already configured"
-    fi
+# Add local bin and cargo to PATH
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+RCEOF
+
+    chown "$DEV_USER:$DEV_USER" "$SHELL_RC"
+    log_success "Shell aliases written to $SHELL_RC"
 fi
 
 # =============================================================================
-# Step 6: GUI Applications (if not skipped)
+# Step 7: Zed IDE
 # =============================================================================
-log_header "Step 6: GUI Applications"
+log_header "Step 7: Zed IDE"
 
-if [ "$SKIP_GUI" = true ] || [ "$IS_WSL" = true ]; then
-    log_skip "GUI applications skipped"
+if [ "$SKIP_GUI" = true ]; then
+    log_skip "Zed IDE skipped (--skip-gui)"
 else
-    # VS Code
-    log_subheader "Visual Studio Code"
-
-    if command -v code >/dev/null 2>&1; then
-        log_info "VS Code already installed"
+    if run_as_user "command -v zed" >/dev/null 2>&1; then
+        log_info "Zed already installed"
     else
-        case "$PKG_MANAGER" in
-            apt)
-                log_info "Installing VS Code..."
-                wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /tmp/packages.microsoft.gpg
-                install -D -o root -g root -m 644 /tmp/packages.microsoft.gpg /etc/apt/keyrings/packages.microsoft.gpg
-                sh -c 'echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list'
-                rm -f /tmp/packages.microsoft.gpg
-                apt-get update
-                apt-get install -y code
-                log_success "VS Code installed"
-                ;;
-            dnf|yum)
-                log_info "Installing VS Code..."
-                rpm --import https://packages.microsoft.com/keys/microsoft.asc
-                sh -c 'echo -e "[code]\nname=Visual Studio Code\nbaseurl=https://packages.microsoft.com/yumrepos/vscode\nenabled=1\ngpgcheck=1\ngpgkey=https://packages.microsoft.com/keys/microsoft.asc" > /etc/yum.repos.d/vscode.repo'
-                $PKG_MANAGER install -y code
-                log_success "VS Code installed"
-                ;;
-            brew)
-                run_as_user "brew install --cask visual-studio-code"
-                log_success "VS Code installed"
-                ;;
-            *)
-                log_warn "VS Code installation not automated for $PKG_MANAGER"
-                log_info "Download from: https://code.visualstudio.com/"
-                ;;
-        esac
+        log_info "Installing Zed IDE..."
+
+        # Zed requires a few system libraries
+        apt-get install -y \
+            libvulkan1 \
+            libxkbcommon-x11-0 \
+            libwayland-client0 \
+            libwayland-cursor0 \
+            libwayland-egl1 \
+            libxcb-shape0 \
+            libxcb-xfixes0 \
+            libsm6 \
+            libice6 \
+            2>/dev/null || true
+
+        # Official Zed installer (installs to ~/.local/bin/zed)
+        run_as_user "curl -f https://zed.dev/install.sh | sh"
+
+        if run_as_user "command -v zed" >/dev/null 2>&1; then
+            ZED_VER=$(run_as_user "zed --version" 2>/dev/null || echo "installed")
+            log_success "Zed installed: $ZED_VER"
+        else
+            log_warn "Zed installer ran but 'zed' not found in PATH yet"
+            log_warn "Add ~/.local/bin to PATH and run: zed"
+        fi
     fi
 
-    # Google Chrome / Chromium
-    log_subheader "Web Browser"
-
-    if command -v google-chrome >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1; then
-        log_info "Chrome/Chromium already installed"
-    else
-        case "$PKG_MANAGER" in
-            apt)
-                if confirm_no "Install Google Chrome?"; then
-                    log_info "Installing Google Chrome..."
-                    wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
-                    apt-get install -y /tmp/chrome.deb 2>/dev/null || dpkg -i /tmp/chrome.deb && apt-get install -f -y
-                    rm /tmp/chrome.deb
-                    log_success "Google Chrome installed"
-                else
-                    log_info "Installing Chromium..."
-                    apt-get install -y chromium-browser 2>/dev/null || apt-get install -y chromium 2>/dev/null || true
-                fi
-                ;;
-            dnf|yum)
-                log_info "Installing Chromium..."
-                $PKG_MANAGER install -y chromium
-                log_success "Chromium installed"
-                ;;
-            brew)
-                run_as_user "brew install --cask google-chrome"
-                log_success "Google Chrome installed"
-                ;;
-        esac
+    # WSL note
+    if [ "$IS_WSL" = true ]; then
+        log_info "In WSL2, Zed launches via WSLg — ensure WSLg is enabled in your Windows setup"
     fi
 fi
 
 # =============================================================================
-# Step 7: WSL-Specific Configuration
+# Step 8: WSL2 Configuration
 # =============================================================================
 if [ "$IS_WSL" = true ]; then
-    log_header "Step 7: WSL Configuration"
+    log_header "Step 8: WSL2 Configuration"
 
-    # WSL utilities
-    if [ "$PKG_MANAGER" = "apt" ]; then
-        log_info "Installing WSL utilities..."
-        apt-get install -y wslu 2>/dev/null || log_warn "wslu not available"
-    fi
+    apt-get install -y wslu 2>/dev/null || log_warn "wslu not available in this release"
 
-    # Configure wsl.conf
     WSL_CONF="/etc/wsl.conf"
     if [ ! -f "$WSL_CONF" ]; then
-        log_info "Configuring WSL settings..."
-        cat > "$WSL_CONF" <<'EOF'
+        log_info "Writing /etc/wsl.conf..."
+        cat > "$WSL_CONF" <<WSLEOF
 [boot]
 systemd=true
 
@@ -1026,48 +859,34 @@ generateResolvConf=true
 
 [interop]
 enabled=true
-appendWindowsPath=true
+appendWindowsPath=false
 
 [user]
-default=USER_PLACEHOLDER
-EOF
-        sed -i "s/USER_PLACEHOLDER/$DEV_USER/g" "$WSL_CONF"
-        log_success "WSL configuration created"
-        log_warn "Restart WSL for changes to take effect: wsl --shutdown"
+default=${DEV_USER}
+WSLEOF
+        log_success "wsl.conf created"
+        log_warn "Run 'wsl --shutdown' from PowerShell and reopen WSL for changes to apply"
     else
-        log_info "WSL configuration already exists"
+        log_info "/etc/wsl.conf already exists — leaving untouched"
     fi
 
-    # Create Windows shortcuts
-    log_subheader "Windows Integration"
+    if [ -n "$SHELL_RC" ] && ! grep -q "# WSL aliases" "$SHELL_RC" 2>/dev/null; then
+        cat >> "$SHELL_RC" <<'WSLRC'
 
-    # Add useful Windows aliases if in interactive mode
-    if [ -n "$SHELL_RC" ]; then
-        if ! grep -q "# WSL Windows aliases" "$SHELL_RC" 2>/dev/null; then
-            log_info "Adding Windows integration aliases..."
-            cat >> "$SHELL_RC" <<'EOF'
-
-# WSL Windows aliases
-alias explorer='explorer.exe'
-alias code='/mnt/c/Users/*/AppData/Local/Programs/Microsoft\ VS\ Code/bin/code 2>/dev/null || code'
-
-EOF
-            chown "$DEV_USER:$DEV_USER" "$SHELL_RC"
-            log_success "Windows aliases added"
-        fi
+# WSL aliases
+alias open='wslview'
+alias pbcopy='clip.exe'
+alias pbpaste='powershell.exe -command "Get-Clipboard"'
+WSLRC
+        chown "$DEV_USER:$DEV_USER" "$SHELL_RC"
+        log_success "WSL aliases added"
     fi
-
-    log_info "Access Windows files at: /mnt/c/"
-    log_info "Access WSL files from Windows: \\\\wsl$\\Ubuntu\\"
 fi
 
 # =============================================================================
-# Step 8: Development Directories
+# Step 9: Development Directories
 # =============================================================================
-log_header "Step 8: Development Directories"
-
-# Create standard development directories
-log_info "Creating development directories..."
+log_header "Step 9: Development Directories"
 
 for dir in dev projects github workspace tmp; do
     DIR_PATH="$USER_HOME/$dir"
@@ -1075,124 +894,234 @@ for dir in dev projects github workspace tmp; do
         run_as_user "mkdir -p $DIR_PATH"
         log_success "Created: ~/$dir"
     else
-        log_info "Exists: ~/$dir"
+        log_info "Exists:  ~/$dir"
     fi
 done
 
 # =============================================================================
-# Step 9: System Optimizations
+# Step 10: System Tuning
 # =============================================================================
-log_header "Step 9: System Optimizations"
+log_header "Step 10: System Tuning"
 
-# Increase file watchers (for development tools)
-if ! grep -q "fs.inotify.max_user_watches" /etc/sysctl.conf 2>/dev/null; then
-    log_info "Increasing file watcher limits..."
-    cat >> /etc/sysctl.conf <<EOF
-
-# Development optimizations
-fs.inotify.max_user_watches=524288
-fs.file-max=65536
+SYSCTL_CONF="/etc/sysctl.d/99-devtools.conf"
+if [ ! -f "$SYSCTL_CONF" ]; then
+    log_info "Writing sysctl tuning config..."
+    cat > "$SYSCTL_CONF" <<'EOF'
+# Development workstation tuning
+fs.inotify.max_user_watches  = 524288
+fs.inotify.max_user_instances = 256
+fs.file-max                  = 65536
+net.core.somaxconn           = 1024
 EOF
-    sysctl -p >/dev/null 2>&1
-    log_success "File watcher limits increased"
+    sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1 || true
+    log_success "sysctl tuning applied"
 else
-    log_info "File watcher limits already configured"
-fi
-
-# Set timezone if not configured
-if command -v timedatectl >/dev/null 2>&1; then
-    CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "unknown")
-    log_info "Timezone: $CURRENT_TZ"
+    log_info "sysctl tuning already configured"
 fi
 
 # =============================================================================
-# Final Summary
+# Step 11: GitHub Sync Service (nuniesmith — all public repos)
+# Clones every public repo under ~/github, keeps them current via hourly pull,
+# and removes local dirs whose remote repo no longer exists.
+# Also prunes Docker images/volumes older than 7 days on each run.
+# =============================================================================
+log_header "Step 11: GitHub Repo Sync Service"
+
+GH_SYNC_SCRIPT="$USER_HOME/.local/bin/gh_sync.sh"
+GH_SYNC_SERVICE="github-sync"
+
+mkdir -p "$USER_HOME/.local/bin"
+chown "$DEV_USER:$DEV_USER" "$USER_HOME/.local/bin"
+
+# --- Write the sync script ---
+log_info "Writing $GH_SYNC_SCRIPT..."
+cat > "$GH_SYNC_SCRIPT" << 'SYNCEOF'
+#!/bin/bash
+# GitHub repo sync — nuniesmith (all public repos)
+# Managed by setup-development-server.sh — edit carefully
+
+set -euo pipefail
+
+GH_USER="nuniesmith"
+TARGET_DIR="$HOME/github"
+LOG_TAG="gh_sync"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$LOG_TAG] $*"; }
+
+log "--- Sync starting ---"
+mkdir -p "$TARGET_DIR"
+cd "$TARGET_DIR"
+
+# Fetch full repo list (handles >100 repos via pagination)
+log "Fetching repo list for $GH_USER..."
+REPO_DATA=""
+PAGE=1
+while true; do
+    PAGE_DATA=$(curl -sf \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/users/$GH_USER/repos?per_page=100&page=$PAGE&type=public" \
+        | jq -r '.[] | "\(.name)|\(.clone_url)"')
+    [ -z "$PAGE_DATA" ] && break
+    REPO_DATA="${REPO_DATA}${PAGE_DATA}"$'\n'
+    PAGE=$((PAGE + 1))
+done
+
+if [ -z "$REPO_DATA" ]; then
+    log "ERROR: Failed to fetch repo list — check network / GitHub API rate limit"
+    exit 1
+fi
+
+ACTIVE_REPOS=$(echo "$REPO_DATA" | cut -d'|' -f1 | sort)
+log "Found $(echo "$ACTIVE_REPOS" | grep -c .) repos"
+
+# Remove local dirs that no longer exist on GitHub
+for local_dir in */; do
+    [ -d "$local_dir" ] || continue
+    dir_name="${local_dir%/}"
+    if ! echo "$ACTIVE_REPOS" | grep -qx "$dir_name"; then
+        log "Removing stale repo: $dir_name"
+        rm -rf "$dir_name"
+    fi
+done
+
+# Clone missing / pull existing
+CLONED=0
+PULLED=0
+FAILED=0
+while IFS='|' read -r REPO_NAME REPO_URL; do
+    [ -z "$REPO_NAME" ] && continue
+    if [ -d "$REPO_NAME/.git" ]; then
+        if git -C "$REPO_NAME" pull --ff-only --quiet 2>/dev/null; then
+            PULLED=$((PULLED + 1))
+        else
+            log "WARN: ff-only pull failed for $REPO_NAME (diverged or dirty) — skipping"
+            FAILED=$((FAILED + 1))
+        fi
+    else
+        if git clone --quiet "$REPO_URL" 2>/dev/null; then
+            log "Cloned: $REPO_NAME"
+            CLONED=$((CLONED + 1))
+        else
+            log "ERROR: Failed to clone $REPO_NAME"
+            FAILED=$((FAILED + 1))
+        fi
+    fi
+done <<< "$REPO_DATA"
+
+log "Sync complete — cloned=$CLONED pulled=$PULLED failed=$FAILED"
+
+# Docker maintenance — prune images/containers older than 7 days and orphaned volumes
+if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+    log "Running Docker prune (images/containers >7d, orphaned volumes)..."
+    docker system prune -af --filter "until=168h" --quiet 2>/dev/null || true
+    docker volume prune -f --quiet 2>/dev/null || true
+    log "Docker prune complete"
+fi
+
+log "--- Done ---"
+SYNCEOF
+
+chmod +x "$GH_SYNC_SCRIPT"
+chown "$DEV_USER:$DEV_USER" "$GH_SYNC_SCRIPT"
+log_success "Sync script written: $GH_SYNC_SCRIPT"
+
+# --- Systemd service unit ---
+log_info "Writing systemd service unit..."
+cat > "/etc/systemd/system/${GH_SYNC_SERVICE}.service" << SVCEOF
+[Unit]
+Description=Sync nuniesmith GitHub repos and prune Docker
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${GH_SYNC_SCRIPT}
+User=${DEV_USER}
+Environment="HOME=${USER_HOME}"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${USER_HOME}/.local/bin:${USER_HOME}/.cargo/bin"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+# --- Systemd timer unit ---
+log_info "Writing systemd timer unit..."
+cat > "/etc/systemd/system/${GH_SYNC_SERVICE}.timer" << TMREOF
+[Unit]
+Description=Hourly GitHub sync and Docker maintenance
+
+[Timer]
+# Run 2 minutes after boot (gives network time to settle)
+OnBootSec=2min
+# Then every hour
+OnUnitActiveSec=1h
+# Re-fire a missed run on next boot if the machine was off
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TMREOF
+
+systemctl daemon-reload
+systemctl enable --now "${GH_SYNC_SERVICE}.timer"
+
+if systemctl is-active --quiet "${GH_SYNC_SERVICE}.timer"; then
+    log_success "github-sync timer enabled and active"
+    NEXT_RUN=$(systemctl show "${GH_SYNC_SERVICE}.timer" --property=NextElapseUSecRealtime --value 2>/dev/null || echo "")
+    log_info "Next run: $(systemctl list-timers ${GH_SYNC_SERVICE}.timer --no-legend 2>/dev/null | awk '{print $1, $2}' || echo 'check: systemctl list-timers')"
+else
+    log_warn "Timer may not be active yet — check: systemctl status ${GH_SYNC_SERVICE}.timer"
+fi
+
+log_info "Run manually anytime: ${CYAN}sudo -u ${DEV_USER} ${GH_SYNC_SCRIPT}${NC}"
+log_info "View logs:            ${CYAN}journalctl -u ${GH_SYNC_SERVICE}.service -f${NC}"
+
+# =============================================================================
+# Done
 # =============================================================================
 log_header "Setup Complete!"
 
-printf "${BOLD}${GREEN}Development Environment Ready!${NC}\n\n"
+printf "${BOLD}${GREEN}Environment ready on %s${NC}\n\n" "$MACHINE_NAME"
 
-printf "${BOLD}System Information:${NC}\n"
-printf "  Machine:      ${CYAN}%s${NC}\n" "$MACHINE_NAME"
-printf "  User:         ${CYAN}%s${NC}\n" "$DEV_USER"
-printf "  Architecture: ${CYAN}%s (%s)${NC}\n" "$ARCH" "$ARCH_NORMALIZED"
-printf "  OS:           ${CYAN}%s %s${NC}\n" "$OS_NAME" "$OS_VERSION"
-if [ "$IS_WSL2" = true ]; then
-    printf "  Environment:  ${CYAN}WSL2${NC}\n"
-elif [ "$IS_WSL" = true ]; then
-    printf "  Environment:  ${CYAN}WSL1${NC}\n"
-fi
-printf "\n"
-
-printf "${BOLD}${GREEN}Installed Components:${NC}\n"
-
-if [ "$SKIP_DEVTOOLS" = false ]; then
-    printf "  ${GREEN}✓${NC} Development tools (git, build-essential, etc.)\n"
-fi
-
-if [ "$SKIP_DOCKER" = false ] && command -v docker >/dev/null 2>&1; then
-    printf "  ${GREEN}✓${NC} Docker $(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')\n"
-fi
-
+printf "${BOLD}Installed:${NC}\n"
+[ "$SKIP_DEVTOOLS"  = false ] && printf "  ${GREEN}✓${NC} Core CLI tools\n"
+[ "$SKIP_DOCKER"    = false ] && command -v docker  >/dev/null 2>&1 && \
+    printf "  ${GREEN}✓${NC} Docker %s + Compose\n" "$(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+[ "$SKIP_CUDA"      = false ] && \
+    printf "  ${GREEN}✓${NC} NVIDIA Container Toolkit (nvidia-container-toolkit)\n"
 if [ "$SKIP_LANGUAGES" = false ]; then
-    if [ -d "$USER_HOME/.nvm" ]; then
-        NODE_VER=$(run_as_user ". $USER_HOME/.nvm/nvm.sh && node --version" 2>/dev/null || echo "")
-        [ -n "$NODE_VER" ] && printf "  ${GREEN}✓${NC} Node.js %s (via nvm)\n" "$NODE_VER"
-    fi
-
-    if command -v python3 >/dev/null 2>&1; then
-        printf "  ${GREEN}✓${NC} Python %s\n" "$(python3 --version 2>/dev/null | cut -d' ' -f2)"
-    fi
-
-    if command -v go >/dev/null 2>&1; then
-        printf "  ${GREEN}✓${NC} Go %s\n" "$(go version 2>/dev/null | cut -d' ' -f3 | tr -d 'go')"
-    fi
-
-    if command -v rustc >/dev/null 2>&1; then
-        printf "  ${GREEN}✓${NC} Rust %s\n" "$(rustc --version 2>/dev/null | cut -d' ' -f2)"
-    fi
+    python3.13 --version  >/dev/null 2>&1 && \
+        printf "  ${GREEN}✓${NC} Python 3.13 + uv + ruff + mypy\n"
+    run_as_user "command -v rustc" >/dev/null 2>&1 && \
+        printf "  ${GREEN}✓${NC} Rust %s (stable)\n" "$(run_as_user 'rustc --version' 2>/dev/null | cut -d' ' -f2)"
+    printf "  ${GREEN}✓${NC} Node.js LTS (nvm)\n"
+    command -v go >/dev/null 2>&1 && \
+        printf "  ${GREEN}✓${NC} Go %s\n" "$(go version | cut -d' ' -f3)"
 fi
+[ "$SKIP_GUI" = false ] && run_as_user "command -v zed" >/dev/null 2>&1 && \
+    printf "  ${GREEN}✓${NC} Zed IDE\n"
+systemctl is-active --quiet "${GH_SYNC_SERVICE}.timer" 2>/dev/null && \
+    printf "  ${GREEN}✓${NC} GitHub sync timer (nuniesmith — hourly, ~/github)\n"
 
-if [ "$SKIP_GUI" = false ] && [ "$IS_WSL" = false ]; then
-    if command -v code >/dev/null 2>&1; then
-        printf "  ${GREEN}✓${NC} Visual Studio Code\n"
-    fi
-fi
+printf "\n${BOLD}${YELLOW}Next steps:${NC}\n"
+
+N=1
+[ "$SKIP_DOCKER" = false ] && \
+    printf "  ${GREEN}%d.${NC} ${CYAN}newgrp docker${NC}  (or log out/in for docker group)\n" "$N" && N=$((N+1))
+printf "  ${GREEN}%d.${NC} ${CYAN}source %s${NC}\n" "$N" "${SHELL_RC:-~/.bashrc}" && N=$((N+1))
+[ "$SKIP_DOCKER" = false ] && \
+    printf "  ${GREEN}%d.${NC} ${CYAN}docker run hello-world${NC}\n" "$N" && N=$((N+1))
+[ "$SKIP_CUDA"   = false ] && \
+    printf "  ${GREEN}%d.${NC} ${CYAN}docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi${NC}\n" "$N" && N=$((N+1))
+printf "  ${GREEN}%d.${NC} Check sync logs: ${CYAN}journalctl -u github-sync.service -f${NC}\n" "$N" && N=$((N+1))
+printf "  ${GREEN}%d.${NC} Trigger sync now: ${CYAN}sudo systemctl start github-sync.service${NC}\n" "$N" && N=$((N+1))
+[ "$IS_WSL"      = true  ] && \
+    printf "  ${GREEN}%d.${NC} Restart WSL: ${CYAN}wsl --shutdown${NC} (from PowerShell)\n" "$N"
 
 printf "\n"
-
-# Next steps
-printf "${BOLD}${YELLOW}Next Steps:${NC}\n"
-
-STEP_NUM=1
-
-if [ "$SKIP_DOCKER" = false ]; then
-    printf "  ${GREEN}%d.${NC} Logout and login again (or run: ${CYAN}newgrp docker${NC}) for docker group to take effect\n" "$STEP_NUM"
-    STEP_NUM=$((STEP_NUM + 1))
-fi
-
-printf "  ${GREEN}%d.${NC} Reload shell: ${CYAN}source ~/.bashrc${NC} (or ${CYAN}~/.zshrc${NC})\n" "$STEP_NUM"
-STEP_NUM=$((STEP_NUM + 1))
-
-if [ "$SKIP_DOCKER" = false ]; then
-    printf "  ${GREEN}%d.${NC} Test Docker: ${CYAN}docker run hello-world${NC}\n" "$STEP_NUM"
-    STEP_NUM=$((STEP_NUM + 1))
-fi
-
-if [ "$IS_WSL" = true ] && grep -q "systemd=true" /etc/wsl.conf 2>/dev/null; then
-    printf "  ${GREEN}%d.${NC} Restart WSL from PowerShell: ${CYAN}wsl --shutdown${NC}\n" "$STEP_NUM"
-    STEP_NUM=$((STEP_NUM + 1))
-fi
-
-printf "\n"
-printf "${BOLD}${GREEN}Development directories created in:${NC}\n"
-printf "  ${CYAN}~/dev${NC}\n"
-printf "  ${CYAN}~/projects${NC}\n"
-printf "  ${CYAN}~/github${NC}\n"
-printf "  ${CYAN}~/workspace${NC}\n"
-printf "\n"
-
-log_success "Your development environment is ready to use!"
+log_success "All done — happy hacking, Jordan!"
 printf "\n"
 
 exit 0
