@@ -6,6 +6,9 @@
 # Options:
 #   -o, --output <file>      Output zip path (default: ./<dirname>_ai_pack.zip)
 #   -s, --max-size <KB>      Skip files larger than N KB (default: 200)
+#   --repo-root              Whitelist mode: only grab compose, Dockerfiles,
+#                            run.sh, todo.md, top-level .proto files.
+#                            Also prunes docs/, scripts/, models/ entirely.
 #   --include-locks          Include lock files (Cargo.lock, yarn.lock, etc.)
 #   --include-env            Include .env files  ⚠ may contain secrets
 #   --no-manifest            Skip the MANIFEST.md added to the zip root
@@ -26,6 +29,7 @@ INCLUDE_LOCKS=false
 INCLUDE_ENV=false
 NO_MANIFEST=false
 VERBOSE=false
+REPO_ROOT_MODE=false          # NEW: whitelist mode for scanning repo roots
 
 # ─── Colours (suppressed when not a tty) ─────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -50,6 +54,13 @@ ${BOLD}Usage:${RESET}
 ${BOLD}Options:${RESET}
   -o, --output <file>    Output zip path  (default: ./<dirname>_ai_pack.zip)
   -s, --max-size <KB>    Skip files larger than N KB  (default: 200)
+  --repo-root            Whitelist mode for repo roots — only grabs:
+                           • docker-compose*.yml/yaml, compose*.yml/yaml
+                           • Dockerfile, Dockerfile.*
+                           • run.sh
+                           • todo.md / TODO.md (case-insensitive)
+                           • *.proto files within 2 levels of root
+                         Also prunes: docs/, scripts/, models/
   --include-locks        Include lock files (Cargo.lock, yarn.lock, etc.)
   --include-env          Include .env files  ⚠ may contain secrets
   --no-manifest          Skip MANIFEST.md in the zip
@@ -68,6 +79,7 @@ while [[ $# -gt 0 ]]; do
         --include-locks)    INCLUDE_LOCKS=true; shift ;;
         --include-env)      INCLUDE_ENV=true; shift ;;
         --no-manifest)      NO_MANIFEST=true; shift ;;
+        --repo-root)        REPO_ROOT_MODE=true; shift ;;   # NEW
         -o|--output)
             [[ -z "${2-}" ]] && die "--output requires a value"
             OUTPUT_ZIP="$2"; shift 2 ;;
@@ -118,6 +130,18 @@ PRUNE_DIRS=(
     "out" "generated" ".cache" "tmp" ".tmp"
 )
 
+# NEW: extra dirs pruned only in --repo-root mode
+REPO_ROOT_PRUNE_DIRS=(
+    "docs"
+    "scripts"
+    "models"
+)
+
+# Merge in the extra prune dirs when --repo-root is active
+if [[ "$REPO_ROOT_MODE" == true ]]; then
+    PRUNE_DIRS+=("${REPO_ROOT_PRUNE_DIRS[@]}")
+fi
+
 # ─── File extensions that are always binary / generated ───────────────────────
 BINARY_EXTS=(
     # Compiled / linked
@@ -157,13 +181,12 @@ for i in "${!PRUNE_DIRS[@]}"; do
 done
 
 pruned_find() {
-    # Usage: pruned_find [extra find expressions after the prune block]
     find "$TARGET_DIR" -type d \( "${PRUNE_ARGS[@]}" \) -prune -o "$@"
 }
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 is_binary_ext() {
-    local ext="${1,,}"    # lowercase
+    local ext="${1,,}"
     for b in "${BINARY_EXTS[@]}"; do
         [[ "$ext" == "$b" ]] && return 0
     done
@@ -182,7 +205,6 @@ is_lock_file() {
 is_env_file() {
     local base
     base="$(basename "$1")"
-    # Match .env, .env.local, .env.production, etc. but not .env.example/.env.sample
     [[ "$base" == ".env" ]] && return 0
     [[ "$base" =~ ^\.env\.(local|prod|production|staging|development|test)$ ]] && return 0
     return 1
@@ -190,6 +212,51 @@ is_env_file() {
 
 file_size_kb() {
     du -k "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# NEW ── Whitelist check for --repo-root mode ──────────────────────────────────
+# Returns 0 (match) if the file should be included in repo-root mode.
+# We match on basename patterns; proto files are additionally depth-limited
+# to within 2 levels of the target dir (i.e. root or one sub-directory).
+is_whitelisted() {
+    local file="$1"
+    local base
+    base="$(basename "$file")"
+    local lower_base="${base,,}"   # lowercase for case-insensitive checks
+
+    # ── Docker Compose ────────────────────────────────────────────────────────
+    [[ "$base" == docker-compose*.yml  ]] && return 0
+    [[ "$base" == docker-compose*.yaml ]] && return 0
+    [[ "$base" == compose*.yml         ]] && return 0
+    [[ "$base" == compose*.yaml        ]] && return 0
+
+    # ── Dockerfiles ───────────────────────────────────────────────────────────
+    # Matches: Dockerfile, Dockerfile.prod, Dockerfile.dev, etc.
+    [[ "$base" == "Dockerfile"         ]] && return 0
+    [[ "$base" == Dockerfile.*         ]] && return 0
+
+    # ── run.sh ────────────────────────────────────────────────────────────────
+    [[ "$base" == "run.sh"             ]] && return 0
+
+    # ── Todo (case-insensitive) ───────────────────────────────────────────────
+    [[ "$lower_base" == "todo.md"      ]] && return 0
+
+    # ── Proto files — depth-limited to root or one sub-directory ─────────────
+    # e.g. foo.proto or proto/foo.proto → yes
+    #      src/api/v1/foo.proto         → no (depth 3)
+    if [[ "$base" == *.proto ]]; then
+        local rel="${file#"$TARGET_DIR"/}"
+        # Count directory separators to determine depth
+        local slashes="${rel//[^\/]/}"
+        [[ ${#slashes} -le 1 ]] && return 0
+    fi
+
+    # ── src/ — all files under the top-level src/ directory ──────────────────
+    # Binary/size/lock/env filters still apply after this gate.
+    local rel="${file#"$TARGET_DIR"/}"
+    [[ "$rel" == src/* ]] && return 0
+
+    return 1   # not on the whitelist
 }
 
 # ─── Temp working dir ─────────────────────────────────────────────────────────
@@ -200,7 +267,11 @@ PACK_ROOT="$TMPDIR_WORK/pack"
 mkdir -p "$PACK_ROOT"
 
 # ─── Collect files ────────────────────────────────────────────────────────────
-info "Scanning ${BOLD}$TARGET_DIR${RESET} ..."
+if [[ "$REPO_ROOT_MODE" == true ]]; then
+    info "Scanning ${BOLD}$TARGET_DIR${RESET} ${YELLOW}[repo-root whitelist mode]${RESET} ..."
+else
+    info "Scanning ${BOLD}$TARGET_DIR${RESET} ..."
+fi
 
 INCLUDED=()
 SKIPPED_BINARY=()
@@ -208,11 +279,20 @@ SKIPPED_SIZE=()
 SKIPPED_LOCK=()
 SKIPPED_ENV=()
 SKIPPED_NOTEXT=()
+SKIPPED_WHITELIST=()   # NEW: files not on the whitelist in repo-root mode
 
 while IFS= read -r -d '' file; do
     rel="${file#"$TARGET_DIR"/}"
     ext="${file##*.}"
     base="$(basename "$file")"
+
+    # NEW ── repo-root whitelist gate (checked first, before other filters) ───
+    if [[ "$REPO_ROOT_MODE" == true ]]; then
+        if ! is_whitelisted "$file"; then
+            SKIPPED_WHITELIST+=("$rel")
+            continue
+        fi
+    fi
 
     # --- env files ---
     if is_env_file "$file"; then
@@ -245,7 +325,7 @@ while IFS= read -r -d '' file; do
         continue
     fi
 
-    # --- binary content check (catches files with no/unknown extension) ---
+    # --- binary content check ---
     if ! grep -Iq . "$file" 2>/dev/null; then
         SKIPPED_NOTEXT+=("$rel")
         continue
@@ -270,6 +350,7 @@ if [[ "$NO_MANIFEST" == false ]]; then
         echo "**Source:** \`$TARGET_DIR\`"
         echo "**Packed:**  $(date)"
         echo "**Max file size:** ${MAX_FILE_KB} KB"
+        echo "**Mode:** $([ "$REPO_ROOT_MODE" == true ] && echo "repo-root whitelist" || echo "full scan")"   # NEW
         echo "**Lock files included:** $INCLUDE_LOCKS"
         echo "**Env files included:** $INCLUDE_ENV"
         echo ""
@@ -285,6 +366,9 @@ if [[ "$NO_MANIFEST" == false ]]; then
         echo "| Skipped — lock files | ${#SKIPPED_LOCK[@]} |"
         echo "| Skipped — env files | ${#SKIPPED_ENV[@]} |"
         echo "| Skipped — binary content | ${#SKIPPED_NOTEXT[@]} |"
+        # NEW: only show whitelist row when relevant
+        [[ "$REPO_ROOT_MODE" == true ]] && \
+        echo "| Skipped — not whitelisted | ${#SKIPPED_WHITELIST[@]} |"
         echo ""
 
         # ── Lines of code by extension ──
@@ -326,6 +410,26 @@ if [[ "$NO_MANIFEST" == false ]]; then
         printf '%s\n' "${INCLUDED[@]}" | sort
         echo '```'
         echo ""
+
+        # NEW ── Whitelist section ─────────────────────────────────────────────
+        # Only shown in repo-root mode; kept brief since the list can be huge
+        if [[ "$REPO_ROOT_MODE" == true ]]; then
+            echo "## Repo-Root Whitelist"
+            echo ""
+            echo "Only the following patterns were eligible for inclusion:"
+            echo ""
+            echo "- \`docker-compose*.yml/yaml\`, \`compose*.yml/yaml\`"
+            echo "- \`Dockerfile\`, \`Dockerfile.*\`"
+            echo "- \`run.sh\`"
+            echo "- \`todo.md\` / \`TODO.md\` (case-insensitive)"
+            echo "- \`*.proto\` within 2 directory levels of root"
+            echo "- All files under \`src/\`"
+            echo ""
+            echo "Pruned directories (in addition to standard list): \`${REPO_ROOT_PRUNE_DIRS[*]}\`"
+            echo ""
+            echo "${#SKIPPED_WHITELIST[@]} files were skipped as not whitelisted."
+            echo ""
+        fi
 
         # ── Skipped sections ──
         if [[ ${#SKIPPED_SIZE[@]} -gt 0 ]]; then
@@ -380,6 +484,10 @@ ok "Pack complete: ${BOLD}$OUTPUT_ZIP${RESET}  (${ZIP_SIZE})"
 echo ""
 echo -e "  ${BOLD}Included:${RESET}  ${#INCLUDED[@]} files  /  ~${TOTAL_LINES} lines"
 
+# NEW: show whitelist skip count in repo-root mode
+[[ "$REPO_ROOT_MODE" == true ]] && \
+    echo -e "  Skipped (not whitelisted): ${#SKIPPED_WHITELIST[@]} files"
+
 [[ ${#SKIPPED_SIZE[@]}   -gt 0 ]] && warn "Skipped (too large):    ${#SKIPPED_SIZE[@]} files  — raise -s/--max-size to include"
 [[ ${#SKIPPED_ENV[@]}    -gt 0 ]] && warn "Skipped (env files):    ${#SKIPPED_ENV[@]} files  — use --include-env to include  ⚠ check for secrets first"
 [[ ${#SKIPPED_LOCK[@]}   -gt 0 ]] && warn "Skipped (lock files):   ${#SKIPPED_LOCK[@]} files  — use --include-locks to include"
@@ -388,8 +496,7 @@ echo -e "  ${BOLD}Included:${RESET}  ${#INCLUDED[@]} files  /  ~${TOTAL_LINES} l
 
 echo ""
 
-# Warn if zip is suspiciously large for an AI context window
 ZIP_KB=$(du -k "$OUTPUT_ZIP" 2>/dev/null | awk '{print $1}')
-if [[ "$ZIP_KB" -gt 5120 ]]; then
-    warn "Zip is >5 MB — consider lowering --max-size or scoping to a subdirectory for upload to AI chats"
+if [[ "$ZIP_KB" -gt 25600 ]]; then
+    warn "Zip is >25 MB — consider lowering --max-size or scoping to a subdirectory for upload to AI chats"
 fi
