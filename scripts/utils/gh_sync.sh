@@ -32,7 +32,7 @@ GH_TOKEN="${GH_TOKEN:-}"
 TOKEN_FILE="${TOKEN_FILE:-$HOME/.config/gh_sync/token}"
 
 # Where to send people to create credentials.
-TOKEN_URL="https://github.com/settings/personal-access-tokens/new"
+TOKEN_URL="https://github.com/settings/tokens"
 SSHKEY_URL="https://github.com/settings/ssh/new"
 
 log() { printf '%s  %s\n' "$(date '+%F %T')" "$*"; }
