@@ -6,6 +6,16 @@
 # Runs unattended (hourly via systemd) without ever destroying local work.
 # When run by hand in a terminal it will also walk you through first-time
 # setup: prompting for a GitHub token and helping register an SSH key.
+#
+# Usage:
+#   gh_sync.sh [sync]                 Run one sync now (default).
+#   gh_sync.sh install [--user|--system]
+#                                     Install a systemd service + hourly timer
+#                                     so the sync keeps running on its own.
+#                                     Defaults to --user unless run as root.
+#   gh_sync.sh uninstall [--user|--system]   Stop and remove the units.
+#   gh_sync.sh status    [--user|--system]   Show timer/service state + logs.
+#   gh_sync.sh help                   Show this help.
 
 set -uo pipefail
 
@@ -40,6 +50,180 @@ die() { log "FATAL: $*"; exit 1; }
 
 # Interactive only if BOTH stdin and stdout are terminals (never under systemd).
 is_tty() { [ -t 0 ] && [ -t 1 ]; }
+
+# ---- systemd service management (install / uninstall / status) ------------
+SERVICE_NAME="${SERVICE_NAME:-gh-sync}"
+# Absolute path to *this* script, so the unit keeps working after a `cd`.
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+
+usage() {
+    sed -n '3,18p' "$SELF_PATH" | sed 's/^# \{0,1\}//'
+}
+
+# Decide user- vs system-scope from an optional flag, defaulting by privilege.
+# Echoes "user" or "system"; non-zero on an unrecognised flag.
+systemd_scope() {
+    case "${1:-}" in
+        --system) echo system ;;
+        --user)   echo user ;;
+        "")       [ "$(id -u)" -eq 0 ] && echo system || echo user ;;
+        *)        return 1 ;;
+    esac
+}
+
+# Write the config env-file (referenced by the unit) with the CURRENTLY
+# effective settings, so `install` captures whatever overrides you passed.
+# Never clobbers an existing file — that's yours to edit.
+write_env_file() {
+    local env_file="$1"
+    if [ -e "$env_file" ]; then
+        log "Keeping existing config: $env_file (edit it to change settings)."
+        return 0
+    fi
+    mkdir -p "$(dirname "$env_file")"
+    {
+        echo "# gh_sync settings — read by the ${SERVICE_NAME} systemd service."
+        echo "# Edit values here, then: systemctl ${2} restart ${SERVICE_NAME}.service"
+        echo "GH_USER=${GH_USER}"
+        echo "TARGET_DIR=${TARGET_DIR}"
+        echo "PROTOCOL=${PROTOCOL}"
+        echo "PRUNE=${PRUNE}"
+        echo "PROTECT_DIRTY=${PROTECT_DIRTY}"
+        echo "DOCKER_MAINT=${DOCKER_MAINT}"
+        echo "SUBMODULE_REMOTE=${SUBMODULE_REMOTE}"
+        echo "AUTO_QUARANTINE=${AUTO_QUARANTINE}"
+        echo "NO_SUBMODULE_REPOS=${NO_SUBMODULE_REPOS}"
+    } > "$env_file"
+    log "Wrote config: $env_file"
+}
+
+cmd_install() {
+    local scope; scope="$(systemd_scope "${1:-}")" \
+        || die "unknown option '$1' (use --user or --system)."
+    command -v systemctl >/dev/null 2>&1 \
+        || die "systemctl not found — this system doesn't use systemd."
+
+    local unit_dir run_user run_home env_file user_line jctl
+    local -a sc=()
+    if [ "$scope" = system ]; then
+        [ "$(id -u)" -eq 0 ] \
+            || die "a --system service needs root; re-run with sudo, or use: $SELF_PATH install --user"
+        run_user="${SUDO_USER:-root}"
+        run_home="$(getent passwd "$run_user" | cut -d: -f6)"
+        [ -n "$run_home" ] || run_home="$HOME"
+        unit_dir="/etc/systemd/system"
+        user_line="User=${run_user}"
+        jctl="journalctl -u ${SERVICE_NAME}.service"
+    else
+        sc=(--user)
+        run_user="$(id -un)"
+        run_home="$HOME"
+        unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+        user_line=""
+        jctl="journalctl --user -u ${SERVICE_NAME}.service"
+    fi
+
+    env_file="${run_home}/.config/gh_sync/gh_sync.env"
+    write_env_file "$env_file" "${sc[*]}"
+
+    mkdir -p "$unit_dir" || die "cannot create $unit_dir"
+
+    {
+        echo "[Unit]"
+        echo "Description=Sync all of ${GH_USER}'s GitHub repos into ${TARGET_DIR}"
+        echo "After=network-online.target"
+        echo "Wants=network-online.target"
+        echo
+        echo "[Service]"
+        echo "Type=oneshot"
+        [ -n "$user_line" ] && echo "$user_line"
+        echo "Environment=HOME=${run_home}"
+        echo "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${run_home}/.local/bin:${run_home}/.cargo/bin"
+        echo "EnvironmentFile=-${env_file}"
+        echo "ExecStart=${SELF_PATH} sync"
+        echo "Nice=10"
+        echo "IOSchedulingClass=idle"
+    } > "${unit_dir}/${SERVICE_NAME}.service"
+
+    cat > "${unit_dir}/${SERVICE_NAME}.timer" <<UNIT
+[Unit]
+Description=Run ${SERVICE_NAME} (GitHub repo sync) hourly
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+    systemctl "${sc[@]}" daemon-reload
+    systemctl "${sc[@]}" enable --now "${SERVICE_NAME}.timer" \
+        || die "failed to enable ${SERVICE_NAME}.timer"
+    log "Installed ${scope} timer: ${SERVICE_NAME}.timer (boots +3min, then hourly)."
+
+    # A user timer only fires while you're logged in unless lingering is on.
+    if [ "$scope" = user ] && command -v loginctl >/dev/null 2>&1; then
+        if loginctl enable-linger "$run_user" 2>/dev/null; then
+            log "Enabled linger for ${run_user} — the timer runs even when logged out."
+        else
+            log "NOTE: could not enable linger. To run when logged out: sudo loginctl enable-linger ${run_user}"
+        fi
+    fi
+
+    if ! [ -r "$TOKEN_FILE" ] && [ -z "$GH_TOKEN" ]; then
+        log "TIP: run '${SELF_PATH}' once by hand to add a GitHub token (private repos + higher rate limit) and set up SSH."
+    fi
+    log "Check status any time:  ${SELF_PATH} status ${1:-}"
+    log "Follow logs with:       ${jctl} -f"
+}
+
+cmd_uninstall() {
+    local scope; scope="$(systemd_scope "${1:-}")" \
+        || die "unknown option '$1' (use --user or --system)."
+    command -v systemctl >/dev/null 2>&1 \
+        || die "systemctl not found — this system doesn't use systemd."
+
+    local unit_dir; local -a sc=()
+    if [ "$scope" = system ]; then
+        [ "$(id -u)" -eq 0 ] || die "a --system uninstall needs root (sudo)."
+        unit_dir="/etc/systemd/system"
+    else
+        sc=(--user)
+        unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    fi
+
+    systemctl "${sc[@]}" disable --now "${SERVICE_NAME}.timer" 2>/dev/null || true
+    rm -f "${unit_dir}/${SERVICE_NAME}.timer" "${unit_dir}/${SERVICE_NAME}.service"
+    systemctl "${sc[@]}" daemon-reload
+    log "Removed ${scope} ${SERVICE_NAME} timer + service. (Config env-file left in place.)"
+}
+
+cmd_status() {
+    local scope; scope="$(systemd_scope "${1:-}")" \
+        || die "unknown option '$1' (use --user or --system)."
+    local -a sc=(); local jctl="journalctl"
+    if [ "$scope" = user ]; then sc=(--user); jctl="journalctl --user"; fi
+    systemctl "${sc[@]}" list-timers "${SERVICE_NAME}.timer" --no-pager 2>/dev/null || true
+    echo
+    systemctl "${sc[@]}" status "${SERVICE_NAME}.service" --no-pager 2>/dev/null || true
+    echo
+    $jctl -u "${SERVICE_NAME}.service" -n 20 --no-pager 2>/dev/null || true
+}
+
+# ---- Command dispatch -----------------------------------------------------
+# Sub-commands act and exit here; "sync" (or no argument) falls through to the
+# rest of the script, which performs the actual mirror.
+case "${1:-sync}" in
+    install)          shift; cmd_install   "${1:-}"; exit $? ;;
+    uninstall|remove) shift; cmd_uninstall "${1:-}"; exit $? ;;
+    status)           shift; cmd_status    "${1:-}"; exit $? ;;
+    -h|--help|help)   usage; exit 0 ;;
+    sync)             shift ;;   # fall through to the sync engine below
+    -*)               die "unknown option '$1' (try: $SELF_PATH help)" ;;
+    *)                die "unknown command '$1' (try: $SELF_PATH help)" ;;
+esac
 
 save_token() {
     mkdir -p "$(dirname "$TOKEN_FILE")"
