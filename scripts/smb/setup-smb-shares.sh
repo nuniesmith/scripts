@@ -8,15 +8,17 @@
 #   freddy     personal srv   [storage]     /mnt/1tb       group-owned
 #                             [local-media] /media         group-owned
 #   desktop    workstation    [home]        /home/jordan   owner-only
-#                             [seed]        /mnt/seed      group-owned
+#                             [seed]        /mnt/seed      owner-only
 #
 # Share modes:
 #   group  - files forced to actions:actions with setgid dirs, so Docker
 #            containers running as uid 1001 keep full access. The setup
-#            recursively chowns the tree.
+#            recursively chowns the tree. Requires an 'actions' user, which
+#            the servers get from the GitHub Actions deploy.
 #   owner  - files keep their real owner. Nothing is chowned, no force user.
-#            Used for /home/jordan: rewriting ownership of a home directory
-#            breaks SSH keys, sudo and login.
+#            Used for everything on the desktop: it has no 'actions' user,
+#            and rewriting ownership of a home directory would break SSH
+#            keys, sudo and login.
 #
 # Usage:
 #   sudo bash setup-smb-shares.sh [OPTIONS]
@@ -90,9 +92,11 @@ case "${TARGET_HOST}" in
         ;;
     desktop)
         SERVER_STRING="Desktop Workstation"
+        # No 'actions' user here — the servers get one from the GitHub Actions
+        # deploy, the desktop doesn't. Both shares stay owner-mode.
         SHARES=(
             "home|/home/${SMB_USER}|owner|Desktop Home (/home/${SMB_USER})"
-            "seed|/mnt/seed|group|Desktop Seed Storage (/mnt/seed)"
+            "seed|/mnt/seed|owner|Desktop Seed Storage (/mnt/seed)"
         )
         ;;
     *)
@@ -105,7 +109,7 @@ esac
 HAS_GROUP_SHARE=false
 for entry in "${SHARES[@]}"; do
     IFS='|' read -r _ _ s_mode _ <<< "${entry}"
-    [[ "${s_mode}" == "group" ]] && HAS_GROUP_SHARE=true
+    if [[ "${s_mode}" == "group" ]]; then HAS_GROUP_SHARE=true; fi
 done
 
 # hosts deny = ALL would lock out localhost too, which breaks the smbclient
@@ -212,23 +216,41 @@ echo "[4/7] Preparing share directories..."
 if [[ "${SKIP_PERMS}" == true ]]; then
     echo "  Skipped (--skip-perms)."
 else
+    USER_HOME="$(getent passwd "${SMB_USER}" | cut -d: -f6)"
+
     for entry in "${SHARES[@]}"; do
         IFS='|' read -r s_name s_path s_mode _ <<< "${entry}"
 
-        if [[ ! -d "${s_path}" ]]; then
-            if [[ "${s_mode}" == "owner" ]]; then
-                echo "  WARNING: ${s_path} does not exist, skipping [${s_name}]."
-                continue
+        if [[ "${s_mode}" == "owner" ]]; then
+            # Owner-mode never rewrites ownership of an existing tree — that is
+            # the whole point of the mode. A missing directory is created and
+            # handed to the user, except for the home directory, where a
+            # missing path means something is wrong that we should not paper over.
+            if [[ ! -d "${s_path}" ]]; then
+                if [[ "${s_path%/}" == "${USER_HOME%/}" ]]; then
+                    echo "  WARNING: home directory ${s_path} does not exist, skipping [${s_name}]."
+                    continue
+                fi
+                echo "  Creating ${s_path} owned by ${SMB_USER}..."
+                mkdir -p "${s_path}"
+                chown "${SMB_USER}:$(id -gn "${SMB_USER}")" "${s_path}"
+                chmod 2775 "${s_path}"
             fi
-            echo "  Creating ${s_path}..."
-            mkdir -p "${s_path}"
+
+            # Existing contents are left as-is, so check rather than assume.
+            if runuser -u "${SMB_USER}" -- test -w "${s_path}" 2>/dev/null; then
+                echo "  [${s_name}] ${s_path}: owner-mode, ownership untouched."
+            else
+                echo "  WARNING: [${s_name}] ${s_path} is not writable by ${SMB_USER}"
+                echo "           (currently $(stat -c '%U:%G %a' "${s_path}")) — SMB writes will fail."
+                echo "           Fix with: chown -R ${SMB_USER}: '${s_path}'"
+            fi
+            continue
         fi
 
-        if [[ "${s_mode}" == "owner" ]]; then
-            # Never recurse into a home directory. Just make sure the top
-            # level is traversable by smbd, which runs as the user anyway.
-            echo "  [${s_name}] ${s_path}: owner-mode, leaving ownership untouched."
-            continue
+        if [[ ! -d "${s_path}" ]]; then
+            echo "  Creating ${s_path}..."
+            mkdir -p "${s_path}"
         fi
 
         chown "${SMB_GROUP}:${SMB_GROUP}" "${s_path}"
@@ -241,7 +263,9 @@ else
             echo '${s_path} permissions complete'
         " >> "${PERMS_LOG}" 2>&1 &
     done
-    echo "  Monitor progress: tail -f ${PERMS_LOG}"
+    if [[ "${HAS_GROUP_SHARE}" == true ]]; then
+        echo "  Monitor progress: tail -f ${PERMS_LOG}"
+    fi
 fi
 
 # ─────────────────────────────────────────────
@@ -401,6 +425,6 @@ echo "  - SMB1 disabled (server min protocol = SMB2)"
 if [[ -z "${ALLOW_HOSTS}" ]]; then
     echo "  - No hosts allow restriction: any host that can reach TCP 445 may authenticate"
 fi
-if [[ "${SKIP_PERMS}" != true ]]; then
+if [[ "${SKIP_PERMS}" != true && "${HAS_GROUP_SHARE}" == true ]]; then
     echo "  - Permission fix may still be running (tail -f ${PERMS_LOG})"
 fi
