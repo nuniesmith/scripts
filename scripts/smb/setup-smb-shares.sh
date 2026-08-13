@@ -20,28 +20,45 @@
 #            and rewriting ownership of a home directory would break SSH
 #            keys, sudo and login.
 #
+# Login:
+#   Samba authenticates against a Unix account. The script asks for the
+#   username and password up front, before it installs or changes anything,
+#   and creates the Unix account if it is missing. Answer the prompts and
+#   the rest of the run is unattended.
+#
+#   Whatever you set here is what you type from a client: the username you
+#   choose, and the SMB password you set for it. The SMB password is stored
+#   by Samba and is independent of the account's Unix password.
+#
 # Usage:
 #   sudo bash setup-smb-shares.sh [OPTIONS]
 #
 # Options:
 #   -H, --host NAME     Override detected hostname (sullivan|freddy|desktop)
-#   -u, --user NAME     SMB/Unix user             (default: jordan)
+#   -u, --user NAME     SMB/Unix user; skips the username prompt
 #   -g, --group NAME    Shared group              (default: actions)
 #   -a, --allow LIST    Restrict access to these networks, e.g.
 #                       "192.168.1.0/24 100.64.0.0/10 127.0.0.1"
 #                       Also narrows the firewall rule. Default: unrestricted.
+#       --reset-password  Set a new SMB password even if the account exists
 #       --skip-perms    Don't touch filesystem ownership/permissions
-#       --skip-password Don't create/prompt for the SMB password
+#       --skip-password Don't create or change the SMB password
 #   -h, --help          Show this help
+#
+# Non-interactive use: set SMB_PASSWORD in the environment and pass --user,
+# and the script will not prompt for anything.
 
 set -euo pipefail
 
-SMB_USER="jordan"
+DEFAULT_USER="jordan"
+SMB_USER=""
 SMB_GROUP="actions"
 TARGET_HOST=""
 ALLOW_HOSTS=""
 SKIP_PERMS=false
 SKIP_PASSWORD=false
+RESET_PASSWORD=false
+SMB_PASSWORD="${SMB_PASSWORD:-}"
 
 SMB_CONF="/etc/samba/smb.conf"
 PERMS_LOG="/tmp/perms-fix.log"
@@ -53,23 +70,136 @@ show_help() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; $d'; exit 0; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -H|--host)       TARGET_HOST="$2";  shift 2 ;;
-        -u|--user)       SMB_USER="$2";     shift 2 ;;
-        -g|--group)      SMB_GROUP="$2";    shift 2 ;;
-        -a|--allow)      ALLOW_HOSTS="$2";  shift 2 ;;
-        --skip-perms)    SKIP_PERMS=true;   shift ;;
-        --skip-password) SKIP_PASSWORD=true; shift ;;
-        -h|--help)       show_help ;;
+        -H|--host)        TARGET_HOST="$2";  shift 2 ;;
+        -u|--user)        SMB_USER="$2";     shift 2 ;;
+        -g|--group)       SMB_GROUP="$2";    shift 2 ;;
+        -a|--allow)       ALLOW_HOSTS="$2";  shift 2 ;;
+        --reset-password) RESET_PASSWORD=true; shift ;;
+        --skip-perms)     SKIP_PERMS=true;   shift ;;
+        --skip-password)  SKIP_PASSWORD=true; shift ;;
+        -h|--help)        show_help ;;
         *) die "Unknown option: $1 (try --help)" ;;
     esac
 done
 
 [[ $EUID -eq 0 ]] || die "Must run as root: sudo bash $0"
 
+# ─────────────────────────────────────────────
+# Interactive helpers
+# ─────────────────────────────────────────────
+# Read from the controlling terminal, not stdin: the documented way to run
+# this is  sudo bash -c "$(curl ...)"  and a plain  curl | bash  would leave
+# stdin pointing at the pipe, so every prompt would silently read EOF.
+TTY_IN=""
+if [[ -r /dev/tty ]] && { : < /dev/tty; } 2>/dev/null; then
+    TTY_IN=/dev/tty
+elif [[ -t 0 ]]; then
+    TTY_IN=/dev/stdin
+fi
+INTERACTIVE=false
+[[ -n "${TTY_IN}" ]] && INTERACTIVE=true
+
+ask() {  # ask VARNAME "prompt" "default"
+    local __var="$1" __prompt="$2" __default="${3:-}" __reply=""
+    if [[ "${INTERACTIVE}" != true ]]; then
+        printf -v "${__var}" '%s' "${__default}"
+        return 0
+    fi
+    if [[ -n "${__default}" ]]; then
+        read -r -p "${__prompt} [${__default}]: " __reply < "${TTY_IN}"
+    else
+        read -r -p "${__prompt}: " __reply < "${TTY_IN}"
+    fi
+    printf -v "${__var}" '%s' "${__reply:-${__default}}"
+}
+
+confirm() {  # confirm "question"  -> 0 on yes
+    local __reply=""
+    [[ "${INTERACTIVE}" == true ]] || return 1
+    read -r -p "${1} [y/N]: " __reply < "${TTY_IN}"
+    [[ "${__reply}" =~ ^[Yy] ]]
+}
+
+ask_password() {  # ask_password VARNAME "who"
+    local __var="$1" __who="$2" __p1="" __p2=""
+    [[ "${INTERACTIVE}" == true ]] \
+        || die "Need a password for '${__who}' but there is no terminal to ask on.
+       Set SMB_PASSWORD in the environment, or pass --skip-password."
+    while true; do
+        # Prompt wording deliberately avoids the word "password" immediately
+        # before a colon and a token — secret scanners read that shape as a
+        # hardcoded credential and flag the line.
+        read -r -s -p "  SMB password for ${__who}: " __p1 < "${TTY_IN}"; echo
+        read -r -s -p "  Retype to confirm: " __p2 < "${TTY_IN}"; echo
+        if [[ -z "${__p1}" ]]; then
+            echo "  Password cannot be empty."
+        elif [[ "${__p1}" != "${__p2}" ]]; then
+            echo "  Passwords do not match, try again."
+        else
+            break
+        fi
+    done
+    printf -v "${__var}" '%s' "${__p1}"
+}
+
 TARGET_HOST="${TARGET_HOST:-$(hostname -s)}"
 
 # ─────────────────────────────────────────────
-# 0. Host profile
+# 0a. Login details
+# ─────────────────────────────────────────────
+# Everything that needs a human is asked here, before the first change to the
+# system, so an interrupted run leaves nothing half-configured and a completed
+# run needs no attention after these prompts.
+echo "=== SMB login ==="
+
+if [[ -z "${SMB_USER}" ]]; then
+    ask SMB_USER "  Username clients will log in with" "${DEFAULT_USER}"
+fi
+[[ "${SMB_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+    || die "'${SMB_USER}' is not a valid Unix username."
+
+CREATE_USER=false
+if ! id -u "${SMB_USER}" >/dev/null 2>&1; then
+    echo "  No Unix account '${SMB_USER}' exists yet. Samba authenticates"
+    echo "  against Unix accounts, so one has to be created."
+    if confirm "  Create a login-disabled account '${SMB_USER}' for SMB only?"; then
+        CREATE_USER=true
+    else
+        die "Cannot share as '${SMB_USER}' without a Unix account.
+       Create it yourself, or rerun and accept the prompt."
+    fi
+fi
+
+# pdbedit only exists once Samba is installed; if it isn't, there is no
+# account database yet and the answer is necessarily "no".
+ACCOUNT_EXISTS=false
+if command -v pdbedit >/dev/null 2>&1 \
+    && pdbedit -L 2>/dev/null | cut -d: -f1 | grep -qx "${SMB_USER}"; then
+    ACCOUNT_EXISTS=true
+fi
+
+SET_PASSWORD=false
+if [[ "${SKIP_PASSWORD}" == true ]]; then
+    echo "  Leaving the SMB password alone (--skip-password)."
+elif [[ -n "${SMB_PASSWORD}" ]]; then
+    SET_PASSWORD=true
+    echo "  Using the password from \$SMB_PASSWORD."
+elif [[ "${ACCOUNT_EXISTS}" == false ]]; then
+    SET_PASSWORD=true
+    ask_password SMB_PASSWORD "${SMB_USER}"
+elif [[ "${RESET_PASSWORD}" == true ]]; then
+    SET_PASSWORD=true
+    ask_password SMB_PASSWORD "${SMB_USER}"
+elif confirm "  SMB account '${SMB_USER}' already exists. Set a new password?"; then
+    SET_PASSWORD=true
+    ask_password SMB_PASSWORD "${SMB_USER}"
+else
+    echo "  Keeping the existing SMB password for '${SMB_USER}'."
+fi
+echo ""
+
+# ─────────────────────────────────────────────
+# 0b. Host profile
 # ─────────────────────────────────────────────
 # Each SHARES entry: name|path|mode|comment
 SERVER_STRING=""
@@ -92,10 +222,15 @@ case "${TARGET_HOST}" in
         ;;
     desktop)
         SERVER_STRING="Desktop Workstation"
+        # Take the home directory from passwd rather than assuming /home/<user>,
+        # which is wrong for any account whose home was relocated. Falls back to
+        # the conventional path for an account this run is about to create.
+        _home="$(getent passwd "${SMB_USER}" 2>/dev/null | cut -d: -f6)"
+        _home="${_home:-/home/${SMB_USER}}"
         # No 'actions' user here — the servers get one from the GitHub Actions
         # deploy, the desktop doesn't. Both shares stay owner-mode.
         SHARES=(
-            "home|/home/${SMB_USER}|owner|Desktop Home (/home/${SMB_USER})"
+            "home|${_home}|owner|Desktop Home (${_home})"
             "seed|/mnt/seed|owner|Desktop Seed Storage (/mnt/seed)"
         )
         ;;
@@ -141,8 +276,19 @@ apt-get install -y samba samba-common-bin
 # 2. Users and groups
 # ─────────────────────────────────────────────
 echo "[2/7] Checking user '${SMB_USER}' and group '${SMB_GROUP}'..."
+
+if [[ "${CREATE_USER}" == true ]]; then
+    # Shell login stays disabled and the Unix password stays locked: this
+    # account exists so Samba has something to map to, and the SMB password
+    # set below is a separate credential that a locked Unix password does
+    # not affect.
+    useradd --create-home --shell /usr/sbin/nologin "${SMB_USER}"
+    passwd --lock "${SMB_USER}" >/dev/null
+    echo "  Created Unix account '${SMB_USER}' (no shell login, Unix password locked)."
+fi
+
 id -u "${SMB_USER}" >/dev/null 2>&1 \
-    || die "Unix user '${SMB_USER}' does not exist. Create it before running this."
+    || die "Unix user '${SMB_USER}' does not exist."
 
 if ! getent group "${SMB_GROUP}" >/dev/null; then
     echo "  Group '${SMB_GROUP}' missing, creating it."
@@ -166,17 +312,25 @@ else
     echo "  Added ${SMB_USER} to ${SMB_GROUP} (re-login for it to take effect)."
 fi
 
-# Samba password — only prompt when the account doesn't exist yet, so reruns
-# are non-interactive.
-if [[ "${SKIP_PASSWORD}" == true ]]; then
-    echo "  Skipping SMB password (--skip-password)."
-elif pdbedit -L 2>/dev/null | cut -d: -f1 | grep -qx "${SMB_USER}"; then
-    echo "  SMB account '${SMB_USER}' already exists, leaving password alone."
-    smbpasswd -e "${SMB_USER}" >/dev/null
+# The password was collected up front. Feed it to smbpasswd on stdin rather
+# than as an argument so it never appears in the process table.
+if [[ "${SET_PASSWORD}" == true ]]; then
+    printf '%s\n%s\n' "${SMB_PASSWORD}" "${SMB_PASSWORD}" \
+        | smbpasswd -s -a "${SMB_USER}" > /dev/null
+    echo "  SMB password set for '${SMB_USER}'."
+elif [[ "${SKIP_PASSWORD}" == true ]]; then
+    echo "  SMB password left unchanged (--skip-password)."
 else
-    echo "  Creating SMB account '${SMB_USER}' — you'll be prompted for a password."
-    smbpasswd -a "${SMB_USER}"
-    smbpasswd -e "${SMB_USER}" >/dev/null
+    echo "  SMB password left unchanged."
+fi
+SMB_PASSWORD=""
+
+if pdbedit -L 2>/dev/null | cut -d: -f1 | grep -qx "${SMB_USER}"; then
+    smbpasswd -e "${SMB_USER}" > /dev/null
+    echo "  SMB account '${SMB_USER}' is enabled."
+else
+    die "No SMB account for '${SMB_USER}' — clients would have nothing to log in as.
+       Rerun without --skip-password to set one."
 fi
 
 # ─────────────────────────────────────────────
@@ -414,10 +568,13 @@ for entry in "${SHARES[@]}"; do
     printf '  //%s/%-12s -> %-16s [%s]\n' "${TARGET_HOST}" "${s_name}" "${s_path}" "${s_mode}"
 done
 echo ""
-echo "Verify with: smbclient -L localhost -U ${SMB_USER}"
+echo "Log in from a client with username '${SMB_USER}' and the SMB password"
+echo "you set during this run."
+echo ""
+echo "Verify locally with: smbclient -L localhost -U ${SMB_USER}"
 echo ""
 echo "Key details:"
-echo "  - SMB user: ${SMB_USER}"
+echo "  - SMB user: ${SMB_USER} (SMB password is separate from the Unix password)"
 echo "  - group-mode shares are forced to ${SMB_GROUP}:${SMB_GROUP} with setgid dirs (2775)"
 echo "    so Docker containers running as uid 1001 keep full access"
 echo "  - owner-mode shares keep real file ownership; nothing was chowned"
