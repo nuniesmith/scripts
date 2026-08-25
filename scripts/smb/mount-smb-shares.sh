@@ -363,7 +363,10 @@ elif command -v apt-get >/dev/null 2>&1; then
     run apt-get update -qq
     run apt-get install -y cifs-utils smbclient
 elif command -v pacman >/dev/null 2>&1; then
-    run pacman -Sy --noconfirm cifs-utils smbclient
+    # -S --needed, never -Sy: refreshing the database without a full -Syu is
+    # the Arch partial-upgrade footgun, and installing a package built against
+    # newer libs than the system has can break more than it fixes.
+    run pacman -S --needed --noconfirm cifs-utils smbclient
 elif command -v dnf >/dev/null 2>&1; then
     run dnf install -y cifs-utils samba-client
 else
