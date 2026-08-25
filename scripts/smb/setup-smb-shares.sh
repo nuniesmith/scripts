@@ -2,13 +2,9 @@
 # setup-smb-shares.sh
 # Configure Samba on a host in the fleet. Run as root (or with sudo).
 #
-# Hosts and their shares:
-#   sullivan   media server   [media]       /mnt/media     group-owned
-#                             [local-media] /media         group-owned
-#   freddy     personal srv   [storage]     /mnt/1tb       group-owned
-#                             [local-media] /media         group-owned
-#   desktop    workstation    [home]        /home/jordan   owner-only
-#                             [seed]        /mnt/seed      owner-only
+# Which host serves what lives in smb-fleet.conf, not in this script — see
+# that file to add a host or change a share. mount-smb-shares.sh reads the
+# same registry from the client side, so the two cannot drift apart.
 #
 # Share modes:
 #   group  - files forced to actions:actions with setgid dirs, so Docker
@@ -34,12 +30,23 @@
 #   sudo bash setup-smb-shares.sh [OPTIONS]
 #
 # Options:
-#   -H, --host NAME     Override detected hostname (sullivan|freddy|desktop)
+#   -H, --host NAME     Override detected hostname (must exist in the registry
+#                       unless you also pass --share)
 #   -u, --user NAME     SMB/Unix user; skips the username prompt
+#   -U, --extra-user N  Additional SMB user with access. Repeatable. Created
+#                       and given an SMB password like the primary user.
 #   -g, --group NAME    Shared group              (default: actions)
 #   -a, --allow LIST    Restrict access to these networks, e.g.
 #                       "192.168.1.0/24 100.64.0.0/10 127.0.0.1"
 #                       Also narrows the firewall rule. Default: unrestricted.
+#   -s, --share SPEC    Add or override one share, as NAME:PATH[:MODE[:COMMENT]]
+#                       MODE is group (default) or owner. Repeatable. Lets you
+#                       set up a host that has no registry entry.
+#   -c, --config PATH   Registry file (default: smb-fleet.conf beside this
+#                       script, then /etc/smb-fleet.conf, then built-in)
+#   -l, --list          Print the registry and exit
+#       --secure        Require SMB3 and encrypted transport
+#       --dry-run       Show what would change; write nothing
 #       --reset-password  Set a new SMB password even if the account exists
 #       --skip-perms    Don't touch filesystem ownership/permissions
 #       --skip-password Don't create or change the SMB password
@@ -50,18 +57,44 @@
 
 set -euo pipefail
 
+# ─────────────────────────────────────────────
+# Shared fleet registry
+# ─────────────────────────────────────────────
+REPO_RAW="https://raw.githubusercontent.com/nuniesmith/scripts/main/scripts/smb"
+_LIB="$(dirname "${BASH_SOURCE[0]}")/smb-fleet.sh"
+
+if [[ -f "$_LIB" ]]; then
+    # shellcheck source=smb-fleet.sh
+    . "$_LIB"
+else
+    _TMP=$(mktemp /tmp/smb-fleet.XXXXXX.sh)
+    printf "  Fetching fleet registry from GitHub...\n"
+    curl -fsSL "${REPO_RAW}/smb-fleet.sh" -o "$_TMP"
+    # shellcheck source=/dev/null
+    . "$_TMP"
+    rm -f "$_TMP"
+fi
+
 DEFAULT_USER="jordan"
 SMB_USER=""
+EXTRA_USERS=()
 SMB_GROUP="actions"
 TARGET_HOST=""
 ALLOW_HOSTS=""
+CLI_SHARES=()
+CONFIG_FILE=""
+LIST_ONLY=false
+SECURE=false
+DRY_RUN=false
 SKIP_PERMS=false
 SKIP_PASSWORD=false
 RESET_PASSWORD=false
 SMB_PASSWORD="${SMB_PASSWORD:-}"
 
 SMB_CONF="/etc/samba/smb.conf"
-PERMS_LOG="/tmp/perms-fix.log"
+# Not /tmp: this runs as root and appends to the file for minutes afterwards,
+# which in a world-writable directory is a symlink waiting to happen.
+PERMS_LOG="/var/log/smb-perms-fix.log"
 APPARMOR_INCLUDE="/etc/apparmor.d/samba/smbd-shares"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -72,8 +105,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -H|--host)        TARGET_HOST="$2";  shift 2 ;;
         -u|--user)        SMB_USER="$2";     shift 2 ;;
+        -U|--extra-user)  EXTRA_USERS+=("$2"); shift 2 ;;
         -g|--group)       SMB_GROUP="$2";    shift 2 ;;
         -a|--allow)       ALLOW_HOSTS="$2";  shift 2 ;;
+        -s|--share)       CLI_SHARES+=("$2"); shift 2 ;;
+        -c|--config)      CONFIG_FILE="$2";  shift 2 ;;
+        -l|--list)        LIST_ONLY=true;    shift ;;
+        --secure)         SECURE=true;       shift ;;
+        --dry-run)        DRY_RUN=true;      shift ;;
         --reset-password) RESET_PASSWORD=true; shift ;;
         --skip-perms)     SKIP_PERMS=true;   shift ;;
         --skip-password)  SKIP_PASSWORD=true; shift ;;
@@ -82,65 +121,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ $EUID -eq 0 ]] || die "Must run as root: sudo bash $0"
+fleet_load "${CONFIG_FILE}"
 
-# ─────────────────────────────────────────────
-# Interactive helpers
-# ─────────────────────────────────────────────
-# Read from the controlling terminal, not stdin: the documented way to run
-# this is  sudo bash -c "$(curl ...)"  and a plain  curl | bash  would leave
-# stdin pointing at the pipe, so every prompt would silently read EOF.
-TTY_IN=""
-if [[ -r /dev/tty ]] && { : < /dev/tty; } 2>/dev/null; then
-    TTY_IN=/dev/tty
-elif [[ -t 0 ]]; then
-    TTY_IN=/dev/stdin
+if [[ "${LIST_ONLY}" == true ]]; then
+    fleet_print
+    exit 0
 fi
-INTERACTIVE=false
-[[ -n "${TTY_IN}" ]] && INTERACTIVE=true
 
-ask() {  # ask VARNAME "prompt" "default"
-    local __var="$1" __prompt="$2" __default="${3:-}" __reply=""
-    if [[ "${INTERACTIVE}" != true ]]; then
-        printf -v "${__var}" '%s' "${__default}"
-        return 0
-    fi
-    if [[ -n "${__default}" ]]; then
-        read -r -p "${__prompt} [${__default}]: " __reply < "${TTY_IN}"
-    else
-        read -r -p "${__prompt}: " __reply < "${TTY_IN}"
-    fi
-    printf -v "${__var}" '%s' "${__reply:-${__default}}"
-}
-
-confirm() {  # confirm "question"  -> 0 on yes
-    local __reply=""
-    [[ "${INTERACTIVE}" == true ]] || return 1
-    read -r -p "${1} [y/N]: " __reply < "${TTY_IN}"
-    [[ "${__reply}" =~ ^[Yy] ]]
-}
-
-ask_password() {  # ask_password VARNAME "who"
-    local __var="$1" __who="$2" __p1="" __p2=""
-    [[ "${INTERACTIVE}" == true ]] \
-        || die "Need a password for '${__who}' but there is no terminal to ask on.
-       Set SMB_PASSWORD in the environment, or pass --skip-password."
-    while true; do
-        # Prompt wording deliberately avoids the word "password" immediately
-        # before a colon and a token — secret scanners read that shape as a
-        # hardcoded credential and flag the line.
-        read -r -s -p "  SMB password for ${__who}: " __p1 < "${TTY_IN}"; echo
-        read -r -s -p "  Retype to confirm: " __p2 < "${TTY_IN}"; echo
-        if [[ -z "${__p1}" ]]; then
-            echo "  Password cannot be empty."
-        elif [[ "${__p1}" != "${__p2}" ]]; then
-            echo "  Passwords do not match, try again."
-        else
-            break
-        fi
-    done
-    printf -v "${__var}" '%s' "${__p1}"
-}
+[[ $EUID -eq 0 ]] || die "Must run as root: sudo bash $0"
 
 TARGET_HOST="${TARGET_HOST:-$(hostname -s)}"
 
@@ -153,93 +141,115 @@ TARGET_HOST="${TARGET_HOST:-$(hostname -s)}"
 echo "=== SMB login ==="
 
 if [[ -z "${SMB_USER}" ]]; then
-    ask SMB_USER "  Username clients will log in with" "${DEFAULT_USER}"
+    fleet_ask SMB_USER "  Username clients will log in with" "${DEFAULT_USER}"
 fi
-[[ "${SMB_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]] \
-    || die "'${SMB_USER}' is not a valid Unix username."
 
-CREATE_USER=false
-if ! id -u "${SMB_USER}" >/dev/null 2>&1; then
-    echo "  No Unix account '${SMB_USER}' exists yet. Samba authenticates"
-    echo "  against Unix accounts, so one has to be created."
-    if confirm "  Create a login-disabled account '${SMB_USER}' for SMB only?"; then
-        CREATE_USER=true
-    else
-        die "Cannot share as '${SMB_USER}' without a Unix account.
+# Accounts to create, and accounts to set a password for, decided up front and
+# acted on in step 2. Parallel arrays keep this working on bash 3.
+CREATE_USERS=()
+PW_USERS=()
+PW_VALUES=()
+
+smb_account_exists() {  # smb_account_exists USER
+    # pdbedit only exists once Samba is installed; if it isn't, there is no
+    # account database yet and the answer is necessarily "no".
+    command -v pdbedit >/dev/null 2>&1 || return 1
+    pdbedit -L 2>/dev/null | cut -d: -f1 | grep -qx "$1"
+}
+
+plan_user() {  # plan_user USER IS_PRIMARY
+    local user="$1" primary="$2" pw=""
+
+    [[ "${user}" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+        || die "'${user}' is not a valid Unix username."
+
+    if ! id -u "${user}" >/dev/null 2>&1; then
+        echo "  No Unix account '${user}' exists yet. Samba authenticates"
+        echo "  against Unix accounts, so one has to be created."
+        if fleet_confirm "  Create a login-disabled account '${user}' for SMB only?"; then
+            CREATE_USERS+=("${user}")
+        else
+            die "Cannot share as '${user}' without a Unix account.
        Create it yourself, or rerun and accept the prompt."
+        fi
     fi
-fi
 
-# pdbedit only exists once Samba is installed; if it isn't, there is no
-# account database yet and the answer is necessarily "no".
-ACCOUNT_EXISTS=false
-if command -v pdbedit >/dev/null 2>&1 \
-    && pdbedit -L 2>/dev/null | cut -d: -f1 | grep -qx "${SMB_USER}"; then
-    ACCOUNT_EXISTS=true
-fi
+    if [[ "${SKIP_PASSWORD}" == true ]]; then
+        echo "  Leaving the SMB password for '${user}' alone (--skip-password)."
+        return 0
+    fi
 
-SET_PASSWORD=false
-if [[ "${SKIP_PASSWORD}" == true ]]; then
-    echo "  Leaving the SMB password alone (--skip-password)."
-elif [[ -n "${SMB_PASSWORD}" ]]; then
-    SET_PASSWORD=true
-    echo "  Using the password from \$SMB_PASSWORD."
-elif [[ "${ACCOUNT_EXISTS}" == false ]]; then
-    SET_PASSWORD=true
-    ask_password SMB_PASSWORD "${SMB_USER}"
-elif [[ "${RESET_PASSWORD}" == true ]]; then
-    SET_PASSWORD=true
-    ask_password SMB_PASSWORD "${SMB_USER}"
-elif confirm "  SMB account '${SMB_USER}' already exists. Set a new password?"; then
-    SET_PASSWORD=true
-    ask_password SMB_PASSWORD "${SMB_USER}"
-else
-    echo "  Keeping the existing SMB password for '${SMB_USER}'."
-fi
+    if [[ "${primary}" == true && -n "${SMB_PASSWORD}" ]]; then
+        echo "  Using the secret from \$SMB_PASSWORD for '${user}'."
+        pw="${SMB_PASSWORD}"
+    elif [[ "${primary}" != true && "${FLEET_INTERACTIVE}" != true ]]; then
+        # $SMB_PASSWORD covers the primary user only — there is no way to
+        # supply one per extra user without a terminal.
+        die "Extra user '${user}' needs an SMB password, and there is no terminal
+       to ask on. Run this interactively, or add the user afterwards with
+       'smbpasswd -a ${user}'."
+    elif ! smb_account_exists "${user}"; then
+        fleet_ask_password pw "${user}"
+    elif [[ "${RESET_PASSWORD}" == true ]]; then
+        fleet_ask_password pw "${user}"
+    elif fleet_confirm "  SMB account '${user}' already exists. Set a new password?"; then
+        fleet_ask_password pw "${user}"
+    else
+        echo "  Keeping the existing SMB password for '${user}'."
+        return 0
+    fi
+
+    PW_USERS+=("${user}")
+    PW_VALUES+=("${pw}")
+}
+
+plan_user "${SMB_USER}" true
+for _u in "${EXTRA_USERS[@]:-}"; do
+    [[ -n "${_u}" ]] || continue
+    plan_user "${_u}" false
+done
+SMB_PASSWORD=""
 echo ""
+
+# valid users list for every share
+VALID_USERS="${SMB_USER}"
+for _u in "${EXTRA_USERS[@]:-}"; do
+    [[ -n "${_u}" ]] && VALID_USERS+=" ${_u}"
+done
 
 # ─────────────────────────────────────────────
 # 0b. Host profile
 # ─────────────────────────────────────────────
-# Each SHARES entry: name|path|mode|comment
-SERVER_STRING=""
-SHARES=()
+# --share entries are layered on top of the registry, so you can extend a
+# known host or stand up one the registry has never heard of.
+for spec in "${CLI_SHARES[@]:-}"; do
+    [[ -n "${spec}" ]] || continue
+    IFS=':' read -r c_name c_path c_mode c_comment <<< "${spec}"
+    [[ -n "${c_name}" && -n "${c_path}" ]] \
+        || die "--share needs at least NAME:PATH, got '${spec}'"
+    fleet_upsert_share "${TARGET_HOST}" "${c_name}" "${c_path}" \
+        "${c_mode:-group}" "${c_comment:-${c_name}}"
+done
 
-case "${TARGET_HOST}" in
-    sullivan)
-        SERVER_STRING="Sullivan Media Server"
-        SHARES=(
-            "media|/mnt/media|group|Sullivan Media Root (/mnt/media)"
-            "local-media|/media|group|Sullivan Local Media (/media)"
-        )
-        ;;
-    freddy)
-        SERVER_STRING="Freddy Personal Server"
-        SHARES=(
-            "storage|/mnt/1tb|group|Freddy 1TB Storage (/mnt/1tb)"
-            "local-media|/media|group|Freddy Local Media (/media)"
-        )
-        ;;
-    desktop)
-        SERVER_STRING="Desktop Workstation"
-        # Take the home directory from passwd rather than assuming /home/<user>,
-        # which is wrong for any account whose home was relocated. Falls back to
-        # the conventional path for an account this run is about to create.
-        _home="$(getent passwd "${SMB_USER}" 2>/dev/null | cut -d: -f6)"
-        _home="${_home:-/home/${SMB_USER}}"
-        # No 'actions' user here — the servers get one from the GitHub Actions
-        # deploy, the desktop doesn't. Both shares stay owner-mode.
-        SHARES=(
-            "home|${_home}|owner|Desktop Home (${_home})"
-            "seed|/mnt/seed|owner|Desktop Seed Storage (/mnt/seed)"
-        )
-        ;;
-    *)
-        die "No share profile for host '${TARGET_HOST}'.
-       Known hosts: sullivan, freddy, desktop.
-       Use --host NAME to force one, or add a profile to this script."
-        ;;
-esac
+fleet_have_host "${TARGET_HOST}" \
+    || die "No profile for host '${TARGET_HOST}'.
+       Known hosts: $(fleet_host_names | tr '\n' ' ')
+       Use --host NAME to force one, add it to ${FLEET_CONF_SOURCE},
+       or define shares inline with --share NAME:PATH[:MODE]."
+
+SERVER_STRING="$(fleet_host_string "${TARGET_HOST}")"
+
+# Each SHARES entry: name|path|mode|comment, with '~' already resolved.
+SHARES=()
+while IFS='|' read -r s_name s_path s_mode s_comment; do
+    [[ -n "${s_name}" ]] || continue
+    s_path="$(fleet_resolve_path "${s_path}" "${SMB_USER}")"
+    SHARES+=("${s_name}|${s_path}|${s_mode}|${s_comment}")
+done < <(fleet_shares_for "${TARGET_HOST}")
+
+[[ ${#SHARES[@]} -gt 0 ]] \
+    || die "Host '${TARGET_HOST}' has no shares defined. Add some to
+       ${FLEET_CONF_SOURCE}, or pass --share NAME:PATH[:MODE]."
 
 HAS_GROUP_SHARE=false
 for entry in "${SHARES[@]}"; do
@@ -254,8 +264,11 @@ if [[ -n "${ALLOW_HOSTS}" ]] && [[ " ${ALLOW_HOSTS} " != *" 127.0.0.1 "* ]]; the
 fi
 
 echo "=== Setting up Samba on ${TARGET_HOST} ==="
-echo "  User:  ${SMB_USER}"
-echo "  Group: ${SMB_GROUP}"
+echo "  Registry: ${FLEET_CONF_SOURCE}"
+echo "  Users:    ${VALID_USERS}"
+echo "  Group:    ${SMB_GROUP}"
+[[ "${SECURE}" == true ]] && echo "  Transport: SMB3, encryption required"
+[[ "${DRY_RUN}" == true ]] && echo "  DRY RUN — nothing will be changed"
 echo "  Shares:"
 for entry in "${SHARES[@]}"; do
     IFS='|' read -r s_name s_path s_mode _ <<< "${entry}"
@@ -264,177 +277,9 @@ done
 echo ""
 
 # ─────────────────────────────────────────────
-# 1. Install Samba
+# smb.conf generation (also used by --dry-run)
 # ─────────────────────────────────────────────
-echo "[1/7] Installing Samba..."
-command -v apt-get >/dev/null || die "This script targets Debian/Ubuntu (apt-get not found)."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y samba samba-common-bin
-
-# ─────────────────────────────────────────────
-# 2. Users and groups
-# ─────────────────────────────────────────────
-echo "[2/7] Checking user '${SMB_USER}' and group '${SMB_GROUP}'..."
-
-if [[ "${CREATE_USER}" == true ]]; then
-    # Shell login stays disabled and the Unix password stays locked: this
-    # account exists so Samba has something to map to, and the SMB password
-    # set below is a separate credential that a locked Unix password does
-    # not affect.
-    useradd --create-home --shell /usr/sbin/nologin "${SMB_USER}"
-    passwd --lock "${SMB_USER}" >/dev/null
-    echo "  Created Unix account '${SMB_USER}' (no shell login, Unix password locked)."
-fi
-
-id -u "${SMB_USER}" >/dev/null 2>&1 \
-    || die "Unix user '${SMB_USER}' does not exist."
-
-if ! getent group "${SMB_GROUP}" >/dev/null; then
-    echo "  Group '${SMB_GROUP}' missing, creating it."
-    groupadd "${SMB_GROUP}"
-fi
-
-# group-mode shares emit "force user = ${SMB_GROUP}", so the *user* has to
-# exist too — groupadd above only covers the group half.
-if [[ "${HAS_GROUP_SHARE}" == true ]] && ! id -u "${SMB_GROUP}" >/dev/null 2>&1; then
-    die "This host has group-mode shares, which set 'force user = ${SMB_GROUP}',
-       but no Unix user '${SMB_GROUP}' exists — smbd would reject every connection.
-       Either create it (e.g. 'useradd -r -u 1001 -g ${SMB_GROUP} ${SMB_GROUP}')
-       to match the servers, or switch those shares to owner-mode in the
-       SHARES table at the top of this script."
-fi
-
-if id -nG "${SMB_USER}" | tr ' ' '\n' | grep -qx "${SMB_GROUP}"; then
-    echo "  ${SMB_USER} already in ${SMB_GROUP}."
-else
-    usermod -aG "${SMB_GROUP}" "${SMB_USER}"
-    echo "  Added ${SMB_USER} to ${SMB_GROUP} (re-login for it to take effect)."
-fi
-
-# The password was collected up front. Feed it to smbpasswd on stdin rather
-# than as an argument so it never appears in the process table.
-if [[ "${SET_PASSWORD}" == true ]]; then
-    printf '%s\n%s\n' "${SMB_PASSWORD}" "${SMB_PASSWORD}" \
-        | smbpasswd -s -a "${SMB_USER}" > /dev/null
-    echo "  SMB password set for '${SMB_USER}'."
-elif [[ "${SKIP_PASSWORD}" == true ]]; then
-    echo "  SMB password left unchanged (--skip-password)."
-else
-    echo "  SMB password left unchanged."
-fi
-SMB_PASSWORD=""
-
-if pdbedit -L 2>/dev/null | cut -d: -f1 | grep -qx "${SMB_USER}"; then
-    smbpasswd -e "${SMB_USER}" > /dev/null
-    echo "  SMB account '${SMB_USER}' is enabled."
-else
-    die "No SMB account for '${SMB_USER}' — clients would have nothing to log in as.
-       Rerun without --skip-password to set one."
-fi
-
-# ─────────────────────────────────────────────
-# 3. AppArmor share paths
-# ─────────────────────────────────────────────
-echo "[3/7] Configuring AppArmor for Samba..."
-if [[ -d /etc/apparmor.d ]]; then
-    mkdir -p "$(dirname "${APPARMOR_INCLUDE}")"
-    {
-        echo "# Generated by setup-smb-shares.sh for ${TARGET_HOST}"
-        for entry in "${SHARES[@]}"; do
-            IFS='|' read -r _ s_path _ _ <<< "${entry}"
-            printf '%s/ r,\n'     "${s_path%/}"
-            printf '%s/** lrwk,\n' "${s_path%/}"
-        done
-    } > "${APPARMOR_INCLUDE}"
-
-    if [[ -f /etc/apparmor.d/usr.sbin.smbd ]] && command -v apparmor_parser >/dev/null; then
-        # Reloading the smbd profile is what actually picks up the include;
-        # a failure here shouldn't abort the whole setup.
-        if apparmor_parser -r /etc/apparmor.d/usr.sbin.smbd 2>/dev/null; then
-            echo "  smbd AppArmor profile reloaded."
-        else
-            echo "  WARNING: could not reload the smbd AppArmor profile; check 'dmesg | grep DENIED' if shares misbehave."
-        fi
-    else
-        echo "  No smbd AppArmor profile present — wrote ${APPARMOR_INCLUDE} for later, nothing to reload."
-    fi
-else
-    echo "  AppArmor not installed, skipping."
-fi
-
-# ─────────────────────────────────────────────
-# 4. Filesystem ownership and permissions
-# ─────────────────────────────────────────────
-echo "[4/7] Preparing share directories..."
-if [[ "${SKIP_PERMS}" == true ]]; then
-    echo "  Skipped (--skip-perms)."
-else
-    USER_HOME="$(getent passwd "${SMB_USER}" | cut -d: -f6)"
-
-    for entry in "${SHARES[@]}"; do
-        IFS='|' read -r s_name s_path s_mode _ <<< "${entry}"
-
-        if [[ "${s_mode}" == "owner" ]]; then
-            # Owner-mode never rewrites ownership of an existing tree — that is
-            # the whole point of the mode. A missing directory is created and
-            # handed to the user, except for the home directory, where a
-            # missing path means something is wrong that we should not paper over.
-            if [[ ! -d "${s_path}" ]]; then
-                if [[ "${s_path%/}" == "${USER_HOME%/}" ]]; then
-                    echo "  WARNING: home directory ${s_path} does not exist, skipping [${s_name}]."
-                    continue
-                fi
-                echo "  Creating ${s_path} owned by ${SMB_USER}..."
-                mkdir -p "${s_path}"
-                chown "${SMB_USER}:$(id -gn "${SMB_USER}")" "${s_path}"
-                chmod 2775 "${s_path}"
-            fi
-
-            # Existing contents are left as-is, so check rather than assume.
-            if runuser -u "${SMB_USER}" -- test -w "${s_path}" 2>/dev/null; then
-                echo "  [${s_name}] ${s_path}: owner-mode, ownership untouched."
-            else
-                echo "  WARNING: [${s_name}] ${s_path} is not writable by ${SMB_USER}"
-                echo "           (currently $(stat -c '%U:%G %a' "${s_path}")) — SMB writes will fail."
-                echo "           Fix with: chown -R ${SMB_USER}: '${s_path}'"
-            fi
-            continue
-        fi
-
-        if [[ ! -d "${s_path}" ]]; then
-            echo "  Creating ${s_path}..."
-            mkdir -p "${s_path}"
-        fi
-
-        chown "${SMB_GROUP}:${SMB_GROUP}" "${s_path}"
-        chmod 2775 "${s_path}"
-        echo "  [${s_name}] ${s_path}: fixing tree in background..."
-        nohup bash -c "
-            chown -R '${SMB_GROUP}:${SMB_GROUP}' '${s_path}' &&
-            find '${s_path}' -type d -exec chmod 2775 {} + &&
-            find '${s_path}' -type f -exec chmod 664 {} + &&
-            echo '${s_path} permissions complete'
-        " >> "${PERMS_LOG}" 2>&1 &
-    done
-    if [[ "${HAS_GROUP_SHARE}" == true ]]; then
-        echo "  Monitor progress: tail -f ${PERMS_LOG}"
-    fi
-fi
-
-# ─────────────────────────────────────────────
-# 5. Write smb.conf
-# ─────────────────────────────────────────────
-echo "[5/7] Writing Samba configuration..."
-
-BACKUP=""
-if [[ -f "${SMB_CONF}" ]]; then
-    BACKUP="${SMB_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "${SMB_CONF}" "${BACKUP}"
-    echo "  Backed up existing config to ${BACKUP}"
-fi
-
-{
+generate_smb_conf() {
     cat << EOF
 [global]
     workgroup = WORKGROUP
@@ -446,9 +291,22 @@ fi
     max log size = 1000
     logging = file
 
-    # Refuse SMB1 outright
+EOF
+    if [[ "${SECURE}" == true ]]; then
+        cat << 'EOF'
+    # --secure: SMB3 only, and refuse to talk in the clear
+    server min protocol = SMB3
+    client min protocol = SMB3
+    smb encrypt = required
+EOF
+    else
+        cat << 'EOF'
+    # Refuse SMB1 outright. Re-run with --secure to require SMB3 + encryption.
     server min protocol = SMB2
     client min protocol = SMB2
+EOF
+    fi
+    cat << 'EOF'
 
     # Performance tuning
     use sendfile = yes
@@ -488,7 +346,7 @@ EOF
     path = ${s_path}
     browseable = yes
     read only = no
-    valid users = ${SMB_USER}
+    valid users = ${VALID_USERS}
 EOF
         if [[ "${s_mode}" == "group" ]]; then
             cat << EOF
@@ -507,12 +365,204 @@ EOF
 EOF
         fi
     done
-} > "${SMB_CONF}"
+}
+
+if [[ "${DRY_RUN}" == true ]]; then
+    echo "=== smb.conf that would be written to ${SMB_CONF} ==="
+    generate_smb_conf
+    echo ""
+    echo "=== Dry run complete, nothing changed. ==="
+    exit 0
+fi
+
+# ─────────────────────────────────────────────
+# 1. Install Samba
+# ─────────────────────────────────────────────
+echo "[1/8] Installing Samba..."
+command -v apt-get >/dev/null || die "This script targets Debian/Ubuntu (apt-get not found)."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y samba samba-common-bin
+
+# ─────────────────────────────────────────────
+# 2. Users and groups
+# ─────────────────────────────────────────────
+echo "[2/8] Checking users and group '${SMB_GROUP}'..."
+
+for user in "${CREATE_USERS[@]:-}"; do
+    [[ -n "${user}" ]] || continue
+    # Shell login stays disabled and the Unix password stays locked: this
+    # account exists so Samba has something to map to, and the SMB password
+    # set below is a separate credential that a locked Unix password does
+    # not affect.
+    useradd --create-home --shell /usr/sbin/nologin "${user}"
+    passwd --lock "${user}" >/dev/null
+    echo "  Created Unix account '${user}' (no shell login, Unix password locked)."
+done
+
+for user in ${VALID_USERS}; do
+    id -u "${user}" >/dev/null 2>&1 || die "Unix user '${user}' does not exist."
+done
+
+if ! getent group "${SMB_GROUP}" >/dev/null; then
+    echo "  Group '${SMB_GROUP}' missing, creating it."
+    groupadd "${SMB_GROUP}"
+fi
+
+# group-mode shares emit "force user = ${SMB_GROUP}", so the *user* has to
+# exist too — groupadd above only covers the group half.
+if [[ "${HAS_GROUP_SHARE}" == true ]] && ! id -u "${SMB_GROUP}" >/dev/null 2>&1; then
+    die "This host has group-mode shares, which set 'force user = ${SMB_GROUP}',
+       but no Unix user '${SMB_GROUP}' exists — smbd would reject every connection.
+       Either create it (e.g. 'useradd -r -u 1001 -g ${SMB_GROUP} ${SMB_GROUP}')
+       to match the servers, or switch those shares to owner-mode in
+       ${FLEET_CONF_SOURCE}."
+fi
+
+for user in ${VALID_USERS}; do
+    if id -nG "${user}" | tr ' ' '\n' | grep -qx "${SMB_GROUP}"; then
+        echo "  ${user} already in ${SMB_GROUP}."
+    else
+        usermod -aG "${SMB_GROUP}" "${user}"
+        echo "  Added ${user} to ${SMB_GROUP} (re-login for it to take effect)."
+    fi
+done
+
+# The passwords were collected up front. Feed them to smbpasswd on stdin
+# rather than as arguments so they never appear in the process table.
+for i in "${!PW_USERS[@]}"; do
+    printf '%s\n%s\n' "${PW_VALUES[$i]}" "${PW_VALUES[$i]}" \
+        | smbpasswd -s -a "${PW_USERS[$i]}" > /dev/null
+    echo "  SMB password set for '${PW_USERS[$i]}'."
+    PW_VALUES[i]=""
+done
+PW_VALUES=()
+
+for user in ${VALID_USERS}; do
+    if smb_account_exists "${user}"; then
+        smbpasswd -e "${user}" > /dev/null
+        echo "  SMB account '${user}' is enabled."
+    else
+        die "No SMB account for '${user}' — clients would have nothing to log in as.
+       Rerun without --skip-password to set one."
+    fi
+done
+
+# ─────────────────────────────────────────────
+# 3. AppArmor share paths
+# ─────────────────────────────────────────────
+# Samba ships update-apparmor-samba-profile to generate this file, but it is
+# only wired into the SysV init script, which systemd hosts never run. The
+# smbd profile does 'include if exists <samba/smbd-shares>', so writing it
+# here is what actually grants access to the share paths.
+echo "[3/8] Configuring AppArmor for Samba..."
+if [[ -d /etc/apparmor.d ]]; then
+    mkdir -p "$(dirname "${APPARMOR_INCLUDE}")"
+    {
+        echo "# Generated by setup-smb-shares.sh for ${TARGET_HOST}"
+        for entry in "${SHARES[@]}"; do
+            IFS='|' read -r _ s_path _ _ <<< "${entry}"
+            printf '"%s/" rk,\n'      "${s_path%/}"
+            printf '"%s/**" rwkl,\n'  "${s_path%/}"
+        done
+    } > "${APPARMOR_INCLUDE}"
+
+    if [[ -f /etc/apparmor.d/usr.sbin.smbd ]] && command -v apparmor_parser >/dev/null; then
+        # Reloading the smbd profile is what actually picks up the include;
+        # a failure here shouldn't abort the whole setup.
+        if apparmor_parser -r /etc/apparmor.d/usr.sbin.smbd 2>/dev/null; then
+            echo "  smbd AppArmor profile reloaded."
+        else
+            echo "  WARNING: could not reload the smbd AppArmor profile; check 'dmesg | grep DENIED' if shares misbehave."
+        fi
+    else
+        echo "  No smbd AppArmor profile present — wrote ${APPARMOR_INCLUDE} for later, nothing to reload."
+    fi
+else
+    echo "  AppArmor not installed, skipping."
+fi
+
+# ─────────────────────────────────────────────
+# 4. Filesystem ownership and permissions
+# ─────────────────────────────────────────────
+echo "[4/8] Preparing share directories..."
+if [[ "${SKIP_PERMS}" == true ]]; then
+    echo "  Skipped (--skip-perms)."
+else
+    # getent exits non-zero for an unknown user, and under `set -e` that would
+    # take the script down inside a command substitution.
+    USER_HOME="$(getent passwd "${SMB_USER}" 2>/dev/null | cut -d: -f6 || true)"
+
+    for entry in "${SHARES[@]}"; do
+        IFS='|' read -r s_name s_path s_mode _ <<< "${entry}"
+
+        if [[ "${s_mode}" == "owner" ]]; then
+            # Owner-mode never rewrites ownership of an existing tree — that is
+            # the whole point of the mode. A missing directory is created and
+            # handed to the user, except for the home directory, where a
+            # missing path means something is wrong that we should not paper over.
+            if [[ ! -d "${s_path}" ]]; then
+                if [[ -n "${USER_HOME}" && "${s_path%/}" == "${USER_HOME%/}" ]]; then
+                    echo "  WARNING: home directory ${s_path} does not exist, skipping [${s_name}]."
+                    continue
+                fi
+                echo "  Creating ${s_path} owned by ${SMB_USER}..."
+                mkdir -p "${s_path}"
+                chown "${SMB_USER}:$(id -gn "${SMB_USER}")" "${s_path}"
+                chmod 2775 "${s_path}"
+            fi
+
+            # Existing contents are left as-is, so check rather than assume.
+            if runuser -u "${SMB_USER}" -- test -w "${s_path}" 2>/dev/null; then
+                echo "  [${s_name}] ${s_path}: owner-mode, ownership untouched."
+            else
+                echo "  WARNING: [${s_name}] ${s_path} is not writable by ${SMB_USER}"
+                echo "           (currently $(stat -c '%U:%G %a' "${s_path}")) — SMB writes will fail."
+                echo "           Fix with: chown -R ${SMB_USER}: '${s_path}'"
+            fi
+            continue
+        fi
+
+        if [[ ! -d "${s_path}" ]]; then
+            echo "  Creating ${s_path}..."
+            mkdir -p "${s_path}"
+        fi
+
+        chown "${SMB_GROUP}:${SMB_GROUP}" "${s_path}"
+        chmod 2775 "${s_path}"
+        echo "  [${s_name}] ${s_path}: fixing tree in background..."
+        # Path and group go in as arguments, not interpolated into the script
+        # text, so a quote or a space in either cannot break out of the shell.
+        nohup bash -c '
+            chown -R "$1:$1" "$2" &&
+            find "$2" -type d -exec chmod 2775 {} + &&
+            find "$2" -type f -exec chmod 664 {} + &&
+            echo "$2 permissions complete"
+        ' _ "${SMB_GROUP}" "${s_path}" >> "${PERMS_LOG}" 2>&1 &
+    done
+    if [[ "${HAS_GROUP_SHARE}" == true ]]; then
+        echo "  Monitor progress: tail -f ${PERMS_LOG}"
+    fi
+fi
+
+# ─────────────────────────────────────────────
+# 5. Write smb.conf
+# ─────────────────────────────────────────────
+echo "[5/8] Writing Samba configuration..."
+
+BACKUP=""
+if [[ -f "${SMB_CONF}" ]]; then
+    BACKUP="${SMB_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "${SMB_CONF}" "${BACKUP}"
+    echo "  Backed up existing config to ${BACKUP}"
+fi
+
+generate_smb_conf > "${SMB_CONF}"
 
 # ─────────────────────────────────────────────
 # 6. Validate
 # ─────────────────────────────────────────────
-echo "[6/7] Validating configuration..."
+echo "[6/8] Validating configuration..."
 if ! testparm -s "${SMB_CONF}" > /dev/null; then
     echo "ERROR: generated smb.conf failed validation." >&2
     if [[ -n "${BACKUP}" ]]; then
@@ -526,7 +576,7 @@ testparm -s "${SMB_CONF}"
 # ─────────────────────────────────────────────
 # 7. Enable, start, firewall
 # ─────────────────────────────────────────────
-echo "[7/7] Starting Samba..."
+echo "[7/8] Starting Samba..."
 SMB_UNITS=()
 for unit in smbd nmbd; do
     # list-unit-files exits 0 even when nothing matched, so grep is the real test
@@ -558,6 +608,21 @@ else
 fi
 
 # ─────────────────────────────────────────────
+# 8. Self-test
+# ─────────────────────────────────────────────
+# Anonymous share listing: enough to prove smbd is up and the shares parsed,
+# without asking for the password again.
+echo "[8/8] Verifying smbd answers on localhost..."
+if smbclient -L localhost -N >/dev/null 2>&1; then
+    echo "  smbd is answering and advertising its share list."
+elif smbclient -L localhost -N 2>&1 | grep -qi 'NT_STATUS_ACCESS_DENIED'; then
+    echo "  smbd is answering (anonymous listing refused, which is expected)."
+else
+    echo "  WARNING: could not list shares from localhost."
+    echo "           Check: systemctl status smbd; journalctl -u smbd -n 50"
+fi
+
+# ─────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────
 echo ""
@@ -568,17 +633,25 @@ for entry in "${SHARES[@]}"; do
     printf '  //%s/%-12s -> %-16s [%s]\n' "${TARGET_HOST}" "${s_name}" "${s_path}" "${s_mode}"
 done
 echo ""
-echo "Log in from a client with username '${SMB_USER}' and the SMB password"
-echo "you set during this run."
+echo "Log in from a client with one of: ${VALID_USERS}"
+echo "and the SMB password you set during this run."
+echo ""
+echo "Mount these from a Linux client with:"
+echo "  sudo bash mount-smb-shares.sh --server ${TARGET_HOST} --user ${SMB_USER}"
+echo "From Windows, run map-network-drives.ps1 as Administrator."
 echo ""
 echo "Verify locally with: smbclient -L localhost -U ${SMB_USER}"
 echo ""
 echo "Key details:"
-echo "  - SMB user: ${SMB_USER} (SMB password is separate from the Unix password)"
+echo "  - SMB passwords are separate from Unix passwords"
 echo "  - group-mode shares are forced to ${SMB_GROUP}:${SMB_GROUP} with setgid dirs (2775)"
 echo "    so Docker containers running as uid 1001 keep full access"
 echo "  - owner-mode shares keep real file ownership; nothing was chowned"
-echo "  - SMB1 disabled (server min protocol = SMB2)"
+if [[ "${SECURE}" == true ]]; then
+    echo "  - SMB3 required, transport encryption required"
+else
+    echo "  - SMB1 disabled (server min protocol = SMB2); --secure raises this to SMB3 + encryption"
+fi
 if [[ -z "${ALLOW_HOSTS}" ]]; then
     echo "  - No hosts allow restriction: any host that can reach TCP 445 may authenticate"
 fi
