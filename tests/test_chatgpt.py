@@ -24,12 +24,41 @@ keys = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
 with (root / "calls").open("a") as out:
     out.write(json.dumps({"tool": name, "args": args, "cwd": os.getcwd(),
                           "api_env": any(k in os.environ for k in keys),
-                          "codex_home": os.environ.get("CODEX_HOME")}) + "\n")
+                          "codex_home": os.environ.get("CODEX_HOME"),
+                          "noninteractive": os.environ.get("CODEX_NON_INTERACTIVE"),
+                          "path": os.environ.get("PATH")}) + "\n")
+
+if name == "curl":
+    assert args[-1] == "https://chatgpt.com/codex/install.sh"
+    assert args[args.index("--proto") + 1] == "=https"
+    assert args[args.index("--proto-redir") + 1] == "=https"
+    output = Path(args[args.index("--output") + 1])
+    payload = '#!/bin/sh\nexec "$LAUNCHER_TEST_ROOT/bin/install-codex-fixture"\n'
+    if os.environ.get("FAKE_EMPTY_DOWNLOAD"):
+        payload = ""
+    if os.environ.get("FAKE_BAD_SYNTAX"):
+        payload = "if then\n"
+    output.write_text(payload)
+    # Leave a runnable partial response behind to test that failure never runs it.
+    sys.exit(int(os.environ.get("FAKE_DOWNLOAD_FAIL", "0")))
+
+if name == "install-codex-fixture":
+    if os.environ.get("FAKE_INSTALL_FAIL"):
+        sys.exit(3)
+    if not os.environ.get("FAKE_NO_INSTALLED_BINARY"):
+        dest = Path(os.environ.get("CODEX_INSTALL_DIR", str(Path.home() / ".local/bin"))) / "codex"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(Path(__file__).read_text())
+        dest.chmod(0o644 if os.environ.get("FAKE_NOT_EXECUTABLE") else 0o755)
+    sys.exit(0)
 
 if name == "codex":
     while args[:1] == ["-c"]:
         args = args[2:]
-    if args == ["remote-control", "--help"]:
+    if args == ["--version"]:
+        print("codex-cli test-fixture")
+        sys.exit(int(os.environ.get("FAKE_VERSION_FAIL", "0")))
+    elif args == ["remote-control", "--help"]:
         if os.environ.get("FAKE_UNSUPPORTED"):
             # An old CLI might show generic help with exit status zero.
             print("Usage: codex [OPTIONS] [PROMPT]")
@@ -97,12 +126,17 @@ class LauncherTests(unittest.TestCase):
         # Only controlled executables on PATH: missing dependencies cannot fall
         # through to the user's real Codex or tmux installation.
         (self.bin / "cat").symlink_to("/usr/bin/cat")
+        for name in ("sh", "mktemp", "rm"):
+            (self.bin / name).symlink_to("/usr/bin/" + name)
+        (self.root / "tmp").mkdir()
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("TMUX", "SSH_CONNECTION", "SSH_TTY", "CHATGPT_SESSION",
                                  "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS")
                     and not k.startswith("BASH_FUNC_")}
         self.env.update(PATH=str(self.bin), LAUNCHER_TEST_ROOT=str(self.root),
                         CODEX_HOME=str(self.root / "codex-home"),
+                        CODEX_INSTALL_DIR=str(self.root / "installed tools"),
+                        TMPDIR=str(self.root / "tmp"),
                         OPENAI_API_KEY="fake-client-secret",
                         CODEX_API_KEY="fake-client-secret",
                         CODEX_ACCESS_TOKEN="fake-client-secret")
@@ -123,6 +157,13 @@ class LauncherTests(unittest.TestCase):
 
     def existing(self, name="chatgpt"):
         (self.root / "session").write_text(name)
+
+    def prepare_install(self):
+        (self.bin / "codex").unlink()
+        for name in ("curl", "install-codex-fixture"):
+            path = self.bin / name
+            path.write_text(FAKE)
+            path.chmod(0o755)
 
     def test_new_session_and_sanitized_child(self):
         self.run_launcher(self.root)
@@ -191,6 +232,114 @@ class LauncherTests(unittest.TestCase):
                 result = self.run_launcher(self.root, expected=1)
                 self.assertIn("missing", result.stderr)
                 (self.bin / (name + ".saved")).rename(path)
+
+    def test_install_missing_then_launch(self):
+        self.prepare_install()
+        self.run_launcher("--install", self.root)
+        self.assertEqual(len(self.calls("curl")), 1)
+        installer = self.calls("install-codex-fixture")[0]
+        self.assertEqual(installer["noninteractive"], "1")
+        self.assertTrue(installer["path"].startswith(self.env["CODEX_INSTALL_DIR"] + ":"))
+        self.assertFalse(installer["api_env"])
+        self.assertFalse(list((self.root / "tmp").iterdir()))
+        self.assertTrue(any(c["args"] == ["--version"] for c in self.calls("codex")))
+        self.assertEqual(self.calls()[-1]["args"][0], "attach-session")
+
+    def test_install_flag_does_not_upgrade_existing_codex(self):
+        self.run_launcher("--install", self.root)
+        self.assertFalse(self.calls("curl"))
+        self.assertFalse(self.calls("install-codex-fixture"))
+
+    def test_install_flag_preserves_existing_session(self):
+        self.prepare_install()
+        self.existing()
+        self.run_launcher("--install")
+        self.assertFalse(self.calls("codex"))
+        self.assertFalse(self.calls("curl"))
+
+    def test_missing_codex_requires_install_opt_in(self):
+        self.prepare_install()
+        result = self.run_launcher(self.root, expected=1)
+        self.assertIn("--install", result.stderr)
+        self.assertFalse(self.calls("curl"))
+
+    def test_installer_requires_curl(self):
+        self.prepare_install()
+        (self.bin / "curl").unlink()
+        result = self.run_launcher("--install", self.root, expected=1)
+        self.assertIn("curl is missing", result.stderr)
+        self.assertFalse(self.calls("codex"))
+
+    def test_partial_failed_download_is_not_executed(self):
+        self.prepare_install()
+        self.run_launcher("--install", self.root, expected=1, FAKE_DOWNLOAD_FAIL="22")
+        self.assertFalse(self.calls("install-codex-fixture"))
+        self.assertFalse(self.calls("codex"))
+        self.assertFalse(list((self.root / "tmp").iterdir()))
+
+    def test_empty_and_invalid_installer_are_not_executed(self):
+        self.prepare_install()
+        for env in ({"FAKE_EMPTY_DOWNLOAD": "1"}, {"FAKE_BAD_SYNTAX": "1"}):
+            with self.subTest(env=env):
+                self.run_launcher("--install", self.root, expected=1, **env)
+                self.assertFalse(self.calls("install-codex-fixture"))
+                self.assertFalse(list((self.root / "tmp").iterdir()))
+
+    def test_installer_failures_do_not_login_or_start_remote(self):
+        self.prepare_install()
+        for env in ({"FAKE_INSTALL_FAIL": "1"}, {"FAKE_NO_INSTALLED_BINARY": "1"},
+                    {"FAKE_NOT_EXECUTABLE": "1"}):
+            with self.subTest(env=env):
+                self.run_launcher("--install", "--remote", self.root, expected=1, **env)
+                self.assertFalse(self.calls("codex"))
+                self.assertFalse((self.root / "session").exists())
+                self.assertFalse(list((self.root / "tmp").iterdir()))
+
+    def test_installed_binary_must_run(self):
+        self.prepare_install()
+        self.run_launcher("--install", "--remote", self.root, expected=1, FAKE_VERSION_FAIL="7")
+        self.assertEqual([c["args"] for c in self.calls("codex")], [["--version"]])
+        self.assertFalse((self.root / "session").exists())
+
+    def test_install_does_not_clobber_unusable_file(self):
+        self.prepare_install()
+        target = Path(self.env["CODEX_INSTALL_DIR"]) / "codex"
+        target.parent.mkdir()
+        target.write_text("do not replace")
+        self.run_launcher("--install", self.root, expected=1)
+        self.assertEqual(target.read_text(), "do not replace")
+        self.assertFalse(self.calls("curl"))
+
+    def test_custom_install_directory_must_be_absolute_and_no_colon(self):
+        self.prepare_install()
+        for directory in ("relative", str(self.root / "bad:path")):
+            with self.subTest(directory=directory):
+                self.run_launcher("--install", self.root, expected=1, CODEX_INSTALL_DIR=directory)
+                self.assertFalse(self.calls("curl"))
+
+    def test_standalone_discovery_without_path_or_install(self):
+        target = Path(self.env["CODEX_INSTALL_DIR"]) / "codex"
+        target.parent.mkdir()
+        (self.bin / "codex").rename(target)
+        self.run_launcher(self.root)
+        self.assertTrue(self.calls("codex"))
+        self.assertFalse(self.calls("curl"))
+        self.assertTrue(self.calls("codex")[-1]["path"].startswith(str(target.parent) + ":"))
+
+    def test_install_defaults_to_user_local_bin(self):
+        self.prepare_install()
+        # Change HOME only in this child process to keep even the default
+        # installation path isolated from the real user's home directory.
+        self.env.pop("CODEX_INSTALL_DIR")
+        self.run_launcher("--install", self.root, HOME=str(self.root))
+        self.assertTrue((self.root / ".local/bin/codex").is_file())
+
+    def test_install_can_continue_to_pair_without_tmux(self):
+        self.prepare_install()
+        (self.bin / "tmux").unlink()
+        self.run_launcher("--install", "--pair")
+        self.assertEqual(self.calls("codex")[-1]["args"], ["remote-control", "pair"])
+        self.assertFalse(self.calls("tmux"))
 
     def test_login_modes(self):
         for options, environment, expected in (

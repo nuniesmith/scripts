@@ -6,13 +6,17 @@
 the machine where you invoke it: to work on Oryx, SSH into Oryx first. It does
 not connect to another machine merely because you use the same account.
 
-Install `tmux` and the [official Codex CLI](https://learn.chatgpt.com/docs/cli),
-and make sure `codex --version` works in your login shell. The wrapper does not
-install/update packages, edit shell configuration, or touch FKS services.
+Install `tmux` and `curl` if needed (`sudo apt install tmux curl`). The wrapper
+can install a **missing** [official Codex CLI](https://learn.chatgpt.com/docs/cli)
+when explicitly given `--install`; otherwise it makes no installation attempt.
+Run the wrapper as your normal user, **not with sudo**. No npm is required.
 
 From this repository:
 
 ```bash
+# First run: install Codex if missing, then log in and start the terminal.
+bash scripts/utils/chatgpt.sh --install --device-auth /path/to/fks-development-checkout
+
 # Start Codex in a development checkout, or reattach to the existing session.
 bash scripts/utils/chatgpt.sh /path/to/fks-development-checkout
 
@@ -22,6 +26,23 @@ bash scripts/utils/chatgpt.sh --remote /path/to/fks-development-checkout
 # Run separately to enable remote access and display a private pairing code.
 bash scripts/utils/chatgpt.sh --pair
 ```
+
+`--install` downloads the installer from `https://chatgpt.com/codex/install.sh`
+over HTTPS into a private temporary file, checks download completion and shell
+syntax, then runs it without sudo. It uses the upstream noninteractive option
+so installation cannot auto-launch Codex before the wrapper applies its launch
+settings. This is a syntax check, not independent cryptographic verification of
+the installer; release verification is delegated to OpenAI's installer.
+
+The standalone CLI goes into `$HOME/.local/bin`, or `CODEX_INSTALL_DIR` if you
+set an absolute custom directory. The wrapper discovers that location even
+when it is not yet on your shell's `PATH`, and makes it available to the tmux
+session. For direct `codex` commands in your current shell, use
+`export PATH="${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH"`. The wrapper itself
+does not edit shell profiles or install Ubuntu packages. Existing Codex
+installations and running sessions are left alone: `--install` is **not an
+upgrade command**. Install/download failures stop before login or remote start.
+No FKS service is installed, restarted, or changed.
 
 The default tmux session is `chatgpt`. Detach with **Ctrl-b, then d**, and run
 the script again to return. Inside tmux it switches clients instead of nesting.

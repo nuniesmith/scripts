@@ -4,12 +4,14 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Usage: chatgpt.sh [--remote] [--device-auth] [DIRECTORY]
-       chatgpt.sh --pair [--device-auth]
+Usage: chatgpt.sh [--install] [--remote] [--device-auth] [DIRECTORY]
+       chatgpt.sh --pair [--install] [--device-auth]
 
 Attach to the chatgpt tmux session, or start Codex in DIRECTORY (default: $HOME).
 An existing session keeps its original directory, model, and permissions.
 
+  --install      Install a missing Codex CLI with OpenAI's per-user installer.
+                 Requires curl; no sudo, npm, or automatic upgrades.
   --remote       Enable the experimental Codex remote-control daemon first.
   --pair         Enable remote control, print a pairing code, and exit (no tmux).
   --device-auth  Use browser/device-code login; selected automatically over SSH.
@@ -21,6 +23,8 @@ and on-request approvals. Detach with Ctrl-b then d; closing SSH is also safe.
 Remote access is opt-in, host-wide, and can outlive tmux. To disable it, explicitly
 run: codex remote-control stop (this stops the shared Codex daemon).
 Linux phone/app pairing depends on CLI/app version and account availability.
+Installation uses CODEX_INSTALL_DIR (default: $HOME/.local/bin). Run as your
+normal user, not sudo. A successful install continues with login and launch.
 USAGE
 }
 
@@ -29,6 +33,7 @@ die() { printf 'chatgpt.sh: %s\n' "$*" >&2; exit 1; }
 remote=false
 pair=false
 device_auth=false
+allow_install=false
 directory_set=false
 work_dir="$HOME"
 session="${CHATGPT_SESSION:-chatgpt}"
@@ -38,6 +43,7 @@ while (($#)); do
         --remote) remote=true ;;
         --pair) pair=true; remote=true ;;
         --device-auth) device_auth=true ;;
+        --install) allow_install=true ;;
         -h|--help) usage; exit 0 ;;
         --) shift; break ;;
         -*) die "Unknown option: $1 (see --help)" ;;
@@ -76,10 +82,51 @@ if ! $pair; then
     fi
 fi
 
-codex_bin="$(command -v codex)" || die 'Codex is missing. Install the official Codex CLI and ensure codex is on PATH.'
+unset OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN
+install_dir="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"
+
+install_codex() (
+    # Separate trap scope: cleanup completes before the launcher execs tmux.
+    ((EUID != 0)) || die 'Do not install as root. Run chatgpt.sh --install as your normal user, without sudo.'
+    [[ "$install_dir" = /* && "$install_dir" != *:* ]] || die 'CODEX_INSTALL_DIR must be an absolute path without colons.'
+    command -v curl >/dev/null 2>&1 || die 'curl is missing. Install it with: sudo apt install curl'
+    command -v sh >/dev/null 2>&1 || die 'The installer requires sh.'
+    command -v mktemp >/dev/null 2>&1 || die 'The installer requires mktemp.'
+    command -v rm >/dev/null 2>&1 || die 'The installer requires rm for temporary-file cleanup.'
+
+    installer_file="$(mktemp "${TMPDIR:-/tmp}/chatgpt-install.XXXXXXXX.sh")" || die 'Could not create a private installer file.'
+    trap 'rm -f -- "$installer_file"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf 'Installing a missing Codex CLI to %s with the official OpenAI installer.\n' "$install_dir"
+    # Download completely before executing; never run a partially fetched script.
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --connect-timeout 20 --max-time 120 --output "$installer_file" \
+        https://chatgpt.com/codex/install.sh || die 'Installer download failed; nothing was executed.'
+    [[ -s "$installer_file" ]] || die 'The downloaded installer is empty; nothing was executed.'
+    sh -n "$installer_file" || die 'The downloaded installer failed its shell syntax check.'
+    # Scripted install: do not let the installer launch an unsandboxed/default
+    # terminal outside tmux or offer to remove another package-managed install.
+    CODEX_NON_INTERACTIVE=1 PATH="$install_dir:$PATH" sh "$installer_file" || die 'Codex installation failed; no session was launched.'
+)
+
+codex_bin="$(command -v codex || true)"
+if [[ -z "$codex_bin" ]]; then
+    # A fresh SSH shell may not yet include the standalone install location.
+    if [[ -f "$install_dir/codex" && -x "$install_dir/codex" ]]; then
+        codex_bin="$install_dir/codex"
+    else
+        $allow_install || die 'Codex is missing. Rerun with --install to install the official CLI, then sign in.'
+        [[ ! -e "$install_dir/codex" && ! -L "$install_dir/codex" ]] || die 'The install location contains an unusable codex file. Inspect it before replacing it.'
+        install_codex || die 'Unable to install Codex; fix the error above and retry --install.'
+        [[ -f "$install_dir/codex" && -x "$install_dir/codex" ]] || die "The installer did not create an executable at $install_dir/codex."
+        codex_bin="$install_dir/codex"
+        "$codex_bin" --version || die 'The installed Codex CLI could not run; no session was launched.'
+    fi
+    export PATH="$install_dir:$PATH"
+fi
 # An absolute path also works when an older tmux server has a different PATH.
 [[ "$codex_bin" = /* ]] || die 'codex must resolve to an executable on PATH, not a shell function.'
-unset OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN
 
 if $remote; then
     remote_help="$("$codex_bin" remote-control --help 2>/dev/null)" || die 'This Codex CLI does not support remote-control. Use normal tmux/SSH or update Codex.'
