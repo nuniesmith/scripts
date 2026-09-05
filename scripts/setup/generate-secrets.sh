@@ -273,6 +273,58 @@ fi
 printf "\n"
 
 # =============================================================================
+# Step 2b: Root Recovery Credentials
+# =============================================================================
+# The break-glass path for when the actions user or sshd is broken. The key is
+# installed first and password authentication for root over SSH is left
+# untouched, so this step can never be the thing that locks the box out.
+log_info "Step 2b/4: Preparing root recovery credentials..."
+
+ROOT_SSH_DIR="/root/.ssh"
+mkdir -p "$ROOT_SSH_DIR"
+chmod 700 "$ROOT_SSH_DIR"
+
+if [ -f "$ROOT_SSH_DIR/id_ed25519" ]; then
+    log_info "Root SSH key already exists; keeping it"
+else
+    ssh-keygen -t ed25519 -N "" -C "root@$(hostname)-$(date +%Y%m%d)" \
+        -f "$ROOT_SSH_DIR/id_ed25519" >/dev/null 2>&1
+    log_success "Root SSH key generated"
+fi
+chmod 600 "$ROOT_SSH_DIR/id_ed25519"
+chmod 644 "$ROOT_SSH_DIR/id_ed25519.pub"
+
+[ -f "$ROOT_SSH_DIR/authorized_keys" ] || touch "$ROOT_SSH_DIR/authorized_keys"
+chmod 600 "$ROOT_SSH_DIR/authorized_keys"
+
+ROOT_PUB_KEY=$(cat "$ROOT_SSH_DIR/id_ed25519.pub")
+if grep -qF "$ROOT_PUB_KEY" "$ROOT_SSH_DIR/authorized_keys" 2>/dev/null; then
+    log_info "Root public key already authorised"
+else
+    echo "$ROOT_PUB_KEY" >> "$ROOT_SSH_DIR/authorized_keys"
+    log_success "Root public key authorised"
+fi
+
+ROOT_SSH_PRIVATE_KEY=$(cat "$ROOT_SSH_DIR/id_ed25519")
+
+# The root password is for console and provider recovery consoles (Lish, Pi
+# keyboard), not for SSH. sshd is deliberately not reconfigured here: enabling
+# root password login over the network would trade a recovery path for a much
+# larger attack surface.
+ROOT_PASSWORD=$(generate_password)
+if printf 'root:%s\n' "$ROOT_PASSWORD" | chpasswd 2>/dev/null; then
+    log_success "Root password set (console recovery only)"
+else
+    log_warn "Could not set the root password; recording the generated value anyway"
+fi
+
+if [ -f /etc/ssh/sshd_config ]; then
+    ROOT_LOGIN_POLICY=$(grep -E '^[[:space:]]*PermitRootLogin' /etc/ssh/sshd_config | tail -1)
+    log_info "sshd PermitRootLogin: ${ROOT_LOGIN_POLICY:-unset (distro default)}"
+fi
+
+
+# =============================================================================
 # Step 3: Generate Application Secrets
 # =============================================================================
 log_info "Step 3/4: Generating application secrets..."
@@ -330,6 +382,18 @@ SSH_PUBLIC_KEY:
 $SSH_PUBLIC_KEY
 
 # =============================================================================
+# ROOT RECOVERY (console / Lish only — sshd is not reconfigured by this script)
+# =============================================================================
+
+# Root password. Use it on a physical console or the provider's recovery
+# console. It is NOT for SSH: root password login over the network stays off.
+ROOT_PASSWORD=$ROOT_PASSWORD
+
+# Root SSH private key (break-glass access when the actions user is broken)
+ROOT_SSH_KEY:
+$ROOT_SSH_PRIVATE_KEY
+
+# =============================================================================
 # APPLICATION SECRETS
 # =============================================================================
 
@@ -353,6 +417,8 @@ ADMIN_PASSWORD=$ADMIN_PASSWORD
 # ${ENV_PREFIX}_SSH_PORT   | $SSH_PORT
 # ${ENV_PREFIX}_TAILSCALE_IP | ${TAILSCALE_IP:-YOUR_TAILSCALE_IP}
 # ${ENV_PREFIX}_SSH_USER     | actions
+# ${ENV_PREFIX}_ROOT_PASSWORD | (console recovery only, not SSH)
+# ${ENV_PREFIX}_ROOT_SSH_KEY  | (entire ROOT_SSH_KEY above)
 # Legacy callers may use ${ENV_PREFIX}_HOST and ${ENV_PREFIX}_USER as aliases
 # for ${ENV_PREFIX}_TAILSCALE_IP and ${ENV_PREFIX}_SSH_USER respectively.
 # =============================================================================
@@ -385,6 +451,14 @@ if [ "$CI_OUTPUT" = true ]; then
     printf "%s\n" "${TAILSCALE_IP:-CONFIGURE_TAILSCALE_FIRST}"
 
     printf "\n=== %s_SSH_USER ===\n" "$ENV_PREFIX"
+
+    printf "\n=== %s_ROOT_PASSWORD ===\n" "$ENV_PREFIX"
+
+    printf "%s\n" "$ROOT_PASSWORD"
+
+    printf "\n=== %s_ROOT_SSH_KEY (copy entire key including BEGIN/END lines) ===\n" "$ENV_PREFIX"
+
+    printf "%s\n" "$ROOT_SSH_PRIVATE_KEY"
     printf "actions\n"
 
     # Preserve the output names used by older calling workflows.
