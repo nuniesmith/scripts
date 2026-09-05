@@ -1,5 +1,52 @@
 # scripts
 
+## Generate server secrets
+
+Download the raw script and run it as root:
+
+```bash
+curl -fL https://raw.githubusercontent.com/nuniesmith/scripts/main/scripts/setup/generate-secrets.sh \
+  -o generate-secrets.sh &&
+bash -n generate-secrets.sh &&
+sudo bash generate-secrets.sh
+```
+
+If the `actions` user is missing, the script automatically downloads
+`setup-prod-server.sh` and its `setup-ubuntu.sh` library, checks their shell
+syntax, and runs production setup without confirmation prompts. This runs the
+installer's default system updates, Docker, SSH, firewall, and Tailscale setup.
+It requires `curl` and Bash; OpenSSL is checked after setup can install it.
+
+The installer skips secrets generation and Tailscale HTTPS configuration during
+this automatic run. Once setup succeeds and the `actions` user exists, the
+original script continues generating secrets. Complete Tailscale sign-in and
+HTTPS configuration using the setup summary's instructions. Downloads are
+removed on success or failure; any download or setup failure stops generation.
+When `actions` already exists, server setup is skipped.
+
+Secrets default to the `PROD_` prefix. Use `--env dev` or `--env staging` for
+another prefix. For automation, use `--no-confirm` to preserve an existing SSH
+key without prompting; secret values stay in a private temporary credentials
+file and its path is printed. `--ci-output` is a legacy option that prints the
+private key and application secrets for manual copying: do not use it in GitHub
+Actions logs. These options affect secrets; the automatic server installer is
+always `setup-prod-server.sh`.
+
+The shared actions use `PROD_SSH_KEY`, `PROD_SSH_PORT`, `PROD_TAILSCALE_IP`, and
+`PROD_SSH_USER` (`actions`). The old `PROD_HOST` and `PROD_USER` names are legacy
+aliases; new workflows should use the names above. Change the prefix for other
+environments. Tailscale must be connected before copying its IP into GitHub.
+The generator does not upload repository secrets. Tailscale OAuth credentials
+and registry credentials must come from those services; generated application
+secrets should be selected to match the application's actual configuration.
+
+Run the isolated setup tests (no server provisioning or real secrets):
+
+```bash
+python3 -m unittest discover -s tests -p 'test_generate_secrets*.py' -v
+python3 -m unittest discover -s tests -p 'test_setup_ubuntu.py' -v
+```
+
 ## ChatGPT / Codex session on Ubuntu
 
 `scripts/utils/chatgpt.sh` is the Codex counterpart to `claude.sh`. It runs on

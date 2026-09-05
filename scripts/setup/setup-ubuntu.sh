@@ -16,7 +16,7 @@
 # =============================================================================
 
 # Guard against double-sourcing
-[ -n "$_SETUP_UBUNTU_LOADED" ] && return 0
+[ -n "${_SETUP_UBUNTU_LOADED:-}" ] && return 0
 _SETUP_UBUNTU_LOADED=1
 
 # =============================================================================
@@ -140,6 +140,7 @@ lib_detect_system() {
     [ "$IS_WSL"  = true ] && [ "$IS_WSL2" = false ] && log_warn "Env:   WSL1 — upgrade to WSL2 recommended"
     [ "$IS_PI"   = true ]   && log_info "Env:   Raspberry Pi"
     [ "$HAS_NVIDIA" = true ] && log_success "GPU:   NVIDIA detected"
+    return 0
 }
 
 # =============================================================================

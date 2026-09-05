@@ -4,14 +4,16 @@
 #
 # Usage:
 #   chmod +x generate-secrets.sh
-#   sudo ./generate-secrets.sh [--ci-output] [--env ENV]
+#   sudo ./generate-secrets.sh [--no-confirm] [--ci-output] [--env ENV]
 #
 # Options:
-#   --ci-output    Output secrets in CI-friendly format for GitHub Actions
+#   --no-confirm   Reuse existing SSH keys without prompting; keep secrets in a file
+#   --ci-output    Print secret values for manual copying (do not use in CI logs)
 #   --env ENV      Environment prefix for secrets (dev, prod, staging)
 #                  Default: prod
 #
 # This script will:
+# - Run production server setup automatically if the actions user is missing
 # - Generate SSH keys for the actions user
 # - Detect Tailscale IP address
 # - Generate secure passwords and API keys
@@ -20,14 +22,20 @@
 # - Prefix secrets with environment name (DEV_, PROD_, STAGING_)
 
 set -e
+umask 077
 
 # Parse arguments
 CI_OUTPUT=false
+NO_CONFIRM=false
 ENVIRONMENT="prod"
 while [ $# -gt 0 ]; do
     case "$1" in
         --ci-output)
             CI_OUTPUT=true
+            shift
+            ;;
+        --no-confirm)
+            NO_CONFIRM=true
             shift
             ;;
         --env)
@@ -105,23 +113,68 @@ generate_base64_secret() {
     openssl rand -base64 "$length" | tr -d "=+/" | head -c "$length"
 }
 
+# Run setup in a subshell so temporary files are removed on success or failure.
+setup_production_server() (
+    REPO_RAW="https://raw.githubusercontent.com/nuniesmith/scripts/main/scripts/setup"
+
+    for dependency in curl bash; do
+        if ! command -v "$dependency" >/dev/null 2>&1; then
+            log_error "$dependency is required to download and run setup-prod-server.sh. Please install it first."
+            exit 1
+        fi
+    done
+
+    SETUP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/generate-secrets-setup.XXXXXX") || {
+        log_error "Could not create a temporary directory for production setup."
+        exit 1
+    }
+    trap 'rm -rf "$SETUP_DIR"' 0
+    trap 'exit 1' HUP INT TERM
+
+    # Download the library alongside the installer so both use the same source.
+    for setup_file in setup-prod-server.sh setup-ubuntu.sh; do
+        log_info "Downloading $setup_file..."
+        if ! curl -fsSL "${REPO_RAW}/${setup_file}" -o "$SETUP_DIR/$setup_file"; then
+            log_error "Failed to download $setup_file. Server setup was not started."
+            exit 1
+        fi
+        if [ ! -s "$SETUP_DIR/$setup_file" ] || ! bash -n "$SETUP_DIR/$setup_file"; then
+            log_error "Downloaded $setup_file is empty or has invalid shell syntax. Server setup was not started."
+            exit 1
+        fi
+    done
+
+    log_info "Running full production setup (system packages, Docker, SSH, firewall, and Tailscale)."
+    # Generate secrets here; configure Tailscale HTTPS after account sign-in.
+    if ! bash "$SETUP_DIR/setup-prod-server.sh" --actions-user actions \
+        --skip-secrets --skip-tailscale-serve --no-confirm; then
+        log_error "Production server setup failed. Resolve the error above before generating secrets."
+        exit 1
+    fi
+)
+
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
     log_error "Please run this script with sudo"
     exit 1
 fi
 
-# Check if openssl is available
-if ! command -v openssl >/dev/null 2>&1; then
-    log_error "OpenSSL is not installed. Please install it first."
-    exit 1
-fi
-
 ACTIONS_HOME="/home/actions"
 
-# Check if actions user exists
+# Bootstrap the server when its deployment user has not been created yet.
 if ! id "actions" >/dev/null 2>&1; then
-    log_error "User 'actions' does not exist. Please run setup-server.sh first."
+    log_warn "User 'actions' does not exist. Starting setup-prod-server.sh automatically."
+    setup_production_server
+    if ! id "actions" >/dev/null 2>&1; then
+        log_error "Production setup finished but user 'actions' is still missing. Cannot generate secrets."
+        exit 1
+    fi
+    log_success "Production server setup completed. Continuing with secrets generation."
+fi
+
+# Production setup installs OpenSSL; check after it has had a chance to run.
+if ! command -v openssl >/dev/null 2>&1; then
+    log_error "OpenSSL is not installed. Please install it first."
     exit 1
 fi
 
@@ -155,7 +208,7 @@ else
 fi
 
 # Detect SSH port
-SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || :)
 if [ -z "$SSH_PORT" ]; then
     SSH_PORT=22
 fi
@@ -180,7 +233,7 @@ chmod 700 "$SSH_DIR"
 
 REGENERATE_KEY=false
 if [ -f "$SSH_DIR/id_ed25519" ]; then
-    if [ "$CI_OUTPUT" = true ]; then
+    if [ "$CI_OUTPUT" = true ] || [ "$NO_CONFIRM" = true ]; then
         log_info "Using existing SSH key"
     else
         log_warn "SSH key already exists for actions user"
@@ -246,9 +299,7 @@ SSH_PRIVATE_KEY=$(cat "$SSH_DIR/id_ed25519")
 SSH_PUBLIC_KEY=$(cat "$SSH_DIR/id_ed25519.pub")
 
 # Create credentials file
-CREDENTIALS_FILE="/tmp/server_credentials_$(date +%s).txt"
-touch "$CREDENTIALS_FILE"
-chmod 600 "$CREDENTIALS_FILE"
+CREDENTIALS_FILE=$(mktemp "${TMPDIR:-/tmp}/server_credentials_XXXXXXXX.txt")
 
 cat > "$CREDENTIALS_FILE" <<EOF
 # =============================================================================
@@ -300,8 +351,10 @@ ADMIN_PASSWORD=$ADMIN_PASSWORD
 # -------------------------|--------------------------------------------------
 # ${ENV_PREFIX}_SSH_KEY    | (entire SSH_PRIVATE_KEY above)
 # ${ENV_PREFIX}_SSH_PORT   | $SSH_PORT
-# ${ENV_PREFIX}_HOST       | ${TAILSCALE_IP:-YOUR_TAILSCALE_IP}
-# ${ENV_PREFIX}_USER       | actions
+# ${ENV_PREFIX}_TAILSCALE_IP | ${TAILSCALE_IP:-YOUR_TAILSCALE_IP}
+# ${ENV_PREFIX}_SSH_USER     | actions
+# Legacy callers may use ${ENV_PREFIX}_HOST and ${ENV_PREFIX}_USER as aliases
+# for ${ENV_PREFIX}_TAILSCALE_IP and ${ENV_PREFIX}_SSH_USER respectively.
 # =============================================================================
 #
 # For multiple environments, run this script with different --env flags:
@@ -328,9 +381,16 @@ if [ "$CI_OUTPUT" = true ]; then
     printf "\n=== %s_SSH_PORT ===\n" "$ENV_PREFIX"
     printf "%s\n" "$SSH_PORT"
 
-    printf "\n=== %s_HOST ===\n" "$ENV_PREFIX"
+    printf "\n=== %s_TAILSCALE_IP ===\n" "$ENV_PREFIX"
     printf "%s\n" "${TAILSCALE_IP:-CONFIGURE_TAILSCALE_FIRST}"
 
+    printf "\n=== %s_SSH_USER ===\n" "$ENV_PREFIX"
+    printf "actions\n"
+
+    # Preserve the output names used by older calling workflows.
+    printf "\nLegacy aliases for older workflows:\n"
+    printf "\n=== %s_HOST ===\n" "$ENV_PREFIX"
+    printf "%s\n" "${TAILSCALE_IP:-CONFIGURE_TAILSCALE_FIRST}"
     printf "\n=== %s_USER ===\n" "$ENV_PREFIX"
     printf "actions\n"
 
@@ -359,7 +419,7 @@ if [ "$CI_OUTPUT" = true ]; then
     printf "::endgroup::\n"
 
     # Create summary file for GitHub Actions
-    SUMMARY_FILE="/tmp/setup_summary.txt"
+    SUMMARY_FILE=$(mktemp "${TMPDIR:-/tmp}/setup_summary_XXXXXXXX.txt")
     cat > "$SUMMARY_FILE" <<EOF
 ## Server Setup Complete ($ENV_PREFIX Environment)
 
@@ -378,8 +438,8 @@ if [ "$CI_OUTPUT" = true ]; then
 |-------------|-------------|
 | ${ENV_PREFIX}_SSH_KEY | SSH private key for 'actions' user |
 | ${ENV_PREFIX}_SSH_PORT | $SSH_PORT |
-| ${ENV_PREFIX}_HOST | ${TAILSCALE_IP:-Your Tailscale IP} |
-| ${ENV_PREFIX}_USER | actions |
+| ${ENV_PREFIX}_TAILSCALE_IP | ${TAILSCALE_IP:-Your Tailscale IP} |
+| ${ENV_PREFIX}_SSH_USER | actions |
 
 ### Generated Application Secrets
 
@@ -421,7 +481,7 @@ else
 
     printf "${BOLD}2. Add these REQUIRED secrets for %s environment:${NC}\n\n" "$ENV_PREFIX"
 
-    printf "   ${YELLOW}%s_HOST${NC}\n" "$ENV_PREFIX"
+    printf "   ${YELLOW}%s_TAILSCALE_IP${NC}\n" "$ENV_PREFIX"
     printf "   Value: ${CYAN}%s${NC}\n\n" "${TAILSCALE_IP:-⚠️ CONFIGURE TAILSCALE FIRST}"
 
     printf "   ${YELLOW}%s_SSH_KEY${NC}\n" "$ENV_PREFIX"
@@ -430,7 +490,7 @@ else
     printf "   ${YELLOW}%s_SSH_PORT${NC}\n" "$ENV_PREFIX"
     printf "   Value: ${CYAN}%s${NC}\n\n" "$SSH_PORT"
 
-    printf "   ${YELLOW}%s_USER${NC}\n" "$ENV_PREFIX"
+    printf "   ${YELLOW}%s_SSH_USER${NC}\n" "$ENV_PREFIX"
     printf "   Value: ${CYAN}actions${NC}\n\n"
 
     log_header "Quick Commands"
