@@ -9,7 +9,7 @@ import time
 import unittest
 
 
-LAUNCHER = Path(__file__).resolve().parents[1] / "scripts/utils/chatgpt.sh"
+LAUNCHER = Path(__file__).resolve().parents[1] / "src/utils/chatgpt.sh"
 FAKE = r'''#!/usr/bin/python3
 import json
 import os

@@ -5,7 +5,7 @@
 Download the raw script and run it as root:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/nuniesmith/scripts/main/scripts/setup/generate-secrets.sh \
+curl -fL https://raw.githubusercontent.com/nuniesmith/scripts/main/src/setup/generate-secrets.sh \
   -o generate-secrets.sh &&
 bash -n generate-secrets.sh &&
 sudo bash generate-secrets.sh
@@ -49,7 +49,7 @@ python3 -m unittest discover -s tests -p 'test_setup_ubuntu.py' -v
 
 ## ChatGPT / Codex session on Ubuntu
 
-`scripts/utils/chatgpt.sh` is the Codex counterpart to `claude.sh`. It runs on
+`src/utils/chatgpt.sh` is the Codex counterpart to `claude.sh`. It runs on
 the machine where you invoke it: to work on Oryx, SSH into Oryx first. It does
 not connect to another machine merely because you use the same account.
 
@@ -62,16 +62,16 @@ From this repository:
 
 ```bash
 # First run: install Codex if missing, then log in and start the terminal.
-bash scripts/utils/chatgpt.sh --install --device-auth /path/to/fks-development-checkout
+bash src/utils/chatgpt.sh --install --device-auth /path/to/fks-development-checkout
 
 # Start Codex in a development checkout, or reattach to the existing session.
-bash scripts/utils/chatgpt.sh /path/to/fks-development-checkout
+bash src/utils/chatgpt.sh /path/to/fks-development-checkout
 
 # Enable experimental app remote access as well, if supported by your CLI.
-bash scripts/utils/chatgpt.sh --remote /path/to/fks-development-checkout
+bash src/utils/chatgpt.sh --remote /path/to/fks-development-checkout
 
 # Run separately to enable remote access and display a private pairing code.
-bash scripts/utils/chatgpt.sh --pair
+bash src/utils/chatgpt.sh --pair
 ```
 
 `--install` downloads the installer from `https://chatgpt.com/codex/install.sh`
@@ -99,7 +99,7 @@ An existing session retains its original directory, model, and permissions;
 the wrapper does not restart it. Use another session name for another checkout:
 
 ```bash
-CHATGPT_SESSION=chatgpt-review bash scripts/utils/chatgpt.sh /path/to/review-checkout
+CHATGPT_SESSION=chatgpt-review bash src/utils/chatgpt.sh /path/to/review-checkout
 ```
 
 The launcher uses your configured model and reasoning effort. New terminal
