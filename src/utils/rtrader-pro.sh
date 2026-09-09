@@ -8,6 +8,7 @@
 #   ./rtrader-pro.sh --remove                            # delete the prefix
 #   ./rtrader-pro.sh --dotnet the.msi                    # real .NET, if Mono fails
 #   ./rtrader-pro.sh --fonts  the.msi                    # MS corefonts, if text looks wrong
+#   ./rtrader-pro.sh --mono                              # install Wine Mono (Ubuntu omits it)
 #
 # WHY A DEDICATED PREFIX. Everything lands in ~/.wine-rithmic, not the default
 # ~/.wine. A trading terminal is not something to debug alongside whatever else
@@ -68,6 +69,7 @@ for arg in "$@"; do
         --dry-run) DRY_RUN=true ;;
         --dotnet)  USE_DOTNET=true ;;
         --fonts)   USE_FONTS=true ;;
+        --mono)    MODE=mono ;;
         --check)   MODE=check ;;
         --launch)  MODE=launch ;;
         --remove)  MODE=remove ;;
@@ -143,8 +145,66 @@ check() {
     ok "prerequisites present"
 }
 
+# ─── Wine Mono ─────────────────────────────────────────────────────────────
+#
+# Ubuntu does not package it. `apt-cache policy wine-mono` returns nothing on
+# 26.04, and Wine's own download prompt did not appear during wineboot, so a
+# fresh prefix has no .NET implementation at all — the application installs
+# perfectly and then dies with:
+#
+#     err:mscoree:CLRRuntimeInfo_GetRuntimeHost Wine Mono is not installed
+#
+# The version has to MATCH the Wine build: Wine looks for one specific filename
+# in ~/.cache/wine and ignores anything else. Rather than hardcode a number that
+# goes stale, the version is read out of Wine's own appwiz.cpl, which is where
+# the installer prompt gets it from.
+mono_wanted_version() {
+    local cpl
+    for cpl in \
+        /usr/lib/x86_64-linux-gnu/wine/x86_64-windows/appwiz.cpl \
+        /usr/lib/wine/x86_64-windows/appwiz.cpl \
+        /usr/lib/i386-linux-gnu/wine/i386-windows/appwiz.cpl \
+        /usr/lib/wine/i386-windows/appwiz.cpl
+    do
+        [[ -r "$cpl" ]] || continue
+        strings "$cpl" 2>/dev/null | grep -oE 'wine-mono-[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/wine-mono-//'
+        return
+    done
+}
+
+install_mono() {
+    command -v strings >/dev/null 2>&1 || die "need 'strings' (apt install binutils) to read the version Wine wants"
+    local ver
+    ver="$(mono_wanted_version)"
+    [[ -n "$ver" ]] || die "could not read the Wine Mono version from appwiz.cpl — install it by hand from https://dl.winehq.org/wine/wine-mono/"
+
+    local msi="wine-mono-${ver}-x86.msi"
+    local url="https://dl.winehq.org/wine/wine-mono/${ver}/${msi}"
+    local cache="$HOME/.cache/wine"
+
+    say "Wine wants Mono $ver"
+    run mkdir -p "$cache"
+    if [[ -f "$cache/$msi" ]]; then
+        ok "already downloaded: $cache/$msi"
+    else
+        say "Fetching $url"
+        run curl -fL --retry 3 -o "$cache/$msi" "$url" \
+            || die "download failed — check https://dl.winehq.org/wine/wine-mono/ for $ver"
+    fi
+
+    say "Installing into $PREFIX"
+    run env WINEPREFIX="$PREFIX" wine msiexec /i "$cache/$msi"
+    ok "Wine Mono installed — try $0 --launch"
+}
+
 case "$MODE" in
     check)  check; exit $? ;;
+    mono)
+        [[ -d "$PREFIX" ]] || die "no prefix at $PREFIX — install first"
+        export WINEPREFIX="$PREFIX"
+        install_mono
+        exit 0
+        ;;
     remove)
         [[ -d "$PREFIX" ]] || die "no prefix at $PREFIX"
         say "Removing $PREFIX"
@@ -241,7 +301,11 @@ cat <<EOF
 
       $0 --fonts ~/Downloads/rtraderpro.msi
 
-  If it installed but will not START, that is Mono not being enough for it:
+  If it dies with "Wine Mono is not installed" — Ubuntu does not ship it:
+
+      $0 --mono
+
+  If it installed but will not START for some other reason:
 
       $0 --remove
       $0 --dotnet ~/Downloads/rtraderpro.msi
