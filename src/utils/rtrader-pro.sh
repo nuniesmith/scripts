@@ -7,6 +7,7 @@
 #   ./rtrader-pro.sh --launch                            # run it afterwards
 #   ./rtrader-pro.sh --remove                            # delete the prefix
 #   ./rtrader-pro.sh --dotnet the.msi                    # real .NET, if Mono fails
+#   ./rtrader-pro.sh --fonts  the.msi                    # MS corefonts, if text looks wrong
 #
 # WHY A DEDICATED PREFIX. Everything lands in ~/.wine-rithmic, not the default
 # ~/.wine. A trading terminal is not something to debug alongside whatever else
@@ -38,9 +39,20 @@ ARCH="${WINEARCH_RITHMIC:-win64}"
 #
 # So: try Mono, and only reach for the chain with --dotnet if the app actually
 # refuses to run.
+# And nothing else by default either.
+#
+# `corefonts` looked harmless and is not: it is a metapackage of about a dozen
+# separate font downloads, each followed by a slow regedit round-trip through
+# Wine. First run on real hardware got five fonts deep and was still going. It
+# affects how text LOOKS, not whether the application runs.
+#
+# The minimal path — create a prefix, run the installer — takes seconds. Add
+# things only when something actually fails, which is the opposite of how the
+# first two versions of this script behaved.
 USE_DOTNET=false
+USE_FONTS=false
 DOTNET="${RITHMIC_DOTNET:-dotnet48}"
-EXTRAS="${RITHMIC_EXTRAS:-corefonts vcrun2019}"
+EXTRAS="${RITHMIC_EXTRAS:-}"
 
 say()  { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m✔\033[0m %s\n' "$*"; }
@@ -55,6 +67,7 @@ for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         --dotnet)  USE_DOTNET=true ;;
+        --fonts)   USE_FONTS=true ;;
         --check)   MODE=check ;;
         --launch)  MODE=launch ;;
         --remove)  MODE=remove ;;
@@ -185,20 +198,27 @@ else
     ok "prefix already exists at $PREFIX (re-running is safe)"
 fi
 
+VERBS="$EXTRAS"
+[[ "$USE_FONTS"  == true ]] && VERBS="corefonts $VERBS"
+[[ "$USE_DOTNET" == true ]] && VERBS="$DOTNET $VERBS"
+
 if [[ "$USE_DOTNET" == true ]]; then
     warn "Installing real .NET ($DOTNET) — this pulls EVERY earlier version too"
     echo "    Roughly ten packages and 500 MB. Twenty minutes on a good line, and"
     echo "    it can still fail on new-WoW64 Wine. Only worth it if Mono did not"
     echo "    work. Ctrl-C now if you have not already tried without --dotnet."
+fi
+[[ "$USE_FONTS" == true ]] && warn "corefonts is a dozen separate downloads — it is slow"
+
+if [[ -n "${VERBS// /}" ]]; then
+    say "Installing: $VERBS"
     # shellcheck disable=SC2086
-    run winetricks -q $DOTNET $EXTRAS
-    ok "runtimes installed"
+    run winetricks -q $VERBS
+    ok "extras installed"
 else
-    say "Using Wine Mono (already present) — no .NET download"
-    echo "    If the app installs but will not start, re-run with --dotnet."
-    # shellcheck disable=SC2086
-    run winetricks -q $EXTRAS
-    ok "fonts and C++ runtime installed"
+    say "No extras — Wine Mono is already in the prefix, going straight to the installer"
+    echo "    If it will not START afterwards, try --dotnet. If the TEXT looks"
+    echo "    wrong, try --fonts. Neither is needed until it is."
 fi
 
 say "Running the installer"
@@ -216,6 +236,10 @@ cat <<EOF
 
   Launch it with:      $0 --launch
   Start over with:     $0 --remove
+
+  If the TEXT looks wrong, add Microsoft's fonts:
+
+      $0 --fonts ~/Downloads/rtraderpro.msi
 
   If it installed but will not START, that is Mono not being enough for it:
 
