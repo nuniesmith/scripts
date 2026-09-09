@@ -285,9 +285,13 @@ case "$MODE" in
         if [[ -d "$PREFIX" ]]; then
             backup="$HOME/rtrader-settings-$(date +%F-%H%M).tgz"
             say "Saving settings to $backup before removing the prefix"
-            ( cd "$PREFIX" && tar czf "$backup" user.reg \
-                $(find drive_c/users -ipath '*ithmic*' -prune -print 2>/dev/null) \
-              ) 2>/dev/null && ok "saved" || warn "could not save settings — continuing"
+            # -print0/--null, not $(find ...): "Start Menu/Programs/Rithmic"
+            # contains a space, and unquoted command substitution splits it into
+            # two nonexistent paths.
+            ( cd "$PREFIX" \
+              && find drive_c/users -ipath '*ithmic*' -prune -print0 2>/dev/null \
+                 | tar czf "$backup" --null -T - user.reg \
+            ) && ok "saved" || warn "could not save settings — continuing"
         fi
         [[ -d "$PREFIX" ]] || die "no prefix at $PREFIX"
         say "Removing $PREFIX"
