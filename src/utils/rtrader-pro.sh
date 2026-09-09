@@ -278,6 +278,17 @@ case "$MODE" in
         exit 0
         ;;
     remove)
+        # Deleting the prefix also deletes the settings inside it — including
+        # "Allow Plugins", which is set once and easy to forget you ever set.
+        # Save them first; an unwanted tarball is cheaper than rediscovering
+        # a preference at 08:25 ET.
+        if [[ -d "$PREFIX" ]]; then
+            backup="$HOME/rtrader-settings-$(date +%F-%H%M).tgz"
+            say "Saving settings to $backup before removing the prefix"
+            ( cd "$PREFIX" && tar czf "$backup" user.reg \
+                $(find drive_c/users -ipath '*ithmic*' -prune -print 2>/dev/null) \
+              ) 2>/dev/null && ok "saved" || warn "could not save settings — continuing"
+        fi
         [[ -d "$PREFIX" ]] || die "no prefix at $PREFIX"
         say "Removing $PREFIX"
         run rm -rf "$PREFIX"
