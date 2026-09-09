@@ -159,18 +159,27 @@ check() {
 # goes stale, the version is read out of Wine's own appwiz.cpl, which is where
 # the installer prompt gets it from.
 mono_wanted_version() {
-    local cpl
-    for cpl in \
-        /usr/lib/x86_64-linux-gnu/wine/x86_64-windows/appwiz.cpl \
-        /usr/lib/wine/x86_64-windows/appwiz.cpl \
-        /usr/lib/i386-linux-gnu/wine/i386-windows/appwiz.cpl \
-        /usr/lib/wine/i386-windows/appwiz.cpl
-    do
-        [[ -r "$cpl" ]] || continue
-        strings "$cpl" 2>/dev/null | grep -oE 'wine-mono-[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/wine-mono-//'
-        return
+    # appwiz.cpl builds the filename from a WIDE string literal:
+    #     L"wine-mono-" MONO_VERSION "-" MONO_ARCH ".msi"
+    # so it is UTF-16LE in the binary. Plain `strings` scans for ASCII and can
+    # never match it — that is why every earlier attempt came back empty on a
+    # machine where the file was present and readable. -el scans 16-bit LE.
+    local cpl f v
+    for cpl in $(find /usr/lib /usr/lib64 /opt -name 'appwiz.cpl' 2>/dev/null); do
+        for enc in -el -e l ""; do
+            v="$(strings $enc "$cpl" 2>/dev/null \
+                 | grep -oE 'wine-mono-[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+            [[ -n "$v" ]] && { echo "${v#wine-mono-}"; return 0; }
+        done
     done
+    # Wine's version is the reliable fallback: the mapping is fixed per release.
+    case "$(wine --version 2>/dev/null)" in
+        wine-10.0*) echo "9.4.0"; return 0 ;;
+        wine-9.0*)  echo "8.1.0"; return 0 ;;
+    esac
+    return 1
 }
+
 
 install_mono() {
     command -v strings >/dev/null 2>&1 || die "need 'strings' (apt install binutils) to read the version Wine wants"
@@ -192,8 +201,10 @@ install_mono() {
             || die "download failed — check https://dl.winehq.org/wine/wine-mono/ for $ver"
     fi
 
-    say "Installing into $PREFIX (a GUI window may appear — let it finish)"
-    run env WINEPREFIX="$PREFIX" wine msiexec /i "$cache/$msi"
+    # Wine searches ~/.cache/wine for exactly this filename and installs it
+    # itself. Preferred over `msiexec /i` because it is the path Wine tests.
+    say "Installing into $PREFIX via wineboot -u"
+    run env WINEPREFIX="$PREFIX" wineboot -u
 
     # Verify rather than announce. msiexec under Wine exits 0 in situations
     # where nothing was installed, and "Wine Mono installed" is a claim worth
