@@ -182,7 +182,7 @@ install_mono() {
     local url="https://dl.winehq.org/wine/wine-mono/${ver}/${msi}"
     local cache="$HOME/.cache/wine"
 
-    say "Wine wants Mono $ver"
+    say "Wine wants Mono $ver (read from appwiz.cpl, not guessed)"
     run mkdir -p "$cache"
     if [[ -f "$cache/$msi" ]]; then
         ok "already downloaded: $cache/$msi"
@@ -192,9 +192,25 @@ install_mono() {
             || die "download failed — check https://dl.winehq.org/wine/wine-mono/ for $ver"
     fi
 
-    say "Installing into $PREFIX"
+    say "Installing into $PREFIX (a GUI window may appear — let it finish)"
     run env WINEPREFIX="$PREFIX" wine msiexec /i "$cache/$msi"
-    ok "Wine Mono installed — try $0 --launch"
+
+    # Verify rather than announce. msiexec under Wine exits 0 in situations
+    # where nothing was installed, and "Wine Mono installed" is a claim worth
+    # checking before the next failure sends someone down a different path.
+    if [[ "$DRY_RUN" == true ]]; then
+        ok "dry run"
+    elif find "$PREFIX/drive_c" -maxdepth 4 -iname 'mono' -type d 2>/dev/null | grep -q . \
+      || ls "$PREFIX/drive_c/windows/mono" >/dev/null 2>&1; then
+        ok "Wine Mono $ver is in the prefix — try: $0 --launch"
+    else
+        warn "msiexec finished but no Mono directory appeared under drive_c"
+        echo "    Look for it by hand:"
+        echo "      find $PREFIX/drive_c -iname 'mono*' -maxdepth 4"
+        echo "    If it really is not there, the fallback is real .NET:"
+        echo "      $0 --remove && $0 --dotnet <the.msi>"
+        exit 1
+    fi
 }
 
 case "$MODE" in
@@ -214,8 +230,22 @@ case "$MODE" in
         ;;
     launch)
         [[ -d "$PREFIX" ]] || die "no prefix at $PREFIX — install first"
-        exe="$(find "$PREFIX/drive_c" -iname 'RTraderPro*.exe' -o -iname 'R Trader Pro*.exe' 2>/dev/null | head -1)"
-        [[ -n "$exe" ]] || die "could not find the executable under $PREFIX/drive_c"
+        # The installed name is "Rithmic Trader Pro.exe", which neither of the
+        # first two guesses ("RTraderPro*.exe", "R Trader Pro*.exe") matched —
+        # the .msi is called rtraderpro.msi and the program is not. Matched on
+        # the words now, in either order, and the -not filters keep the
+        # uninstaller and bundled helpers out of the way.
+        exe="$(find "$PREFIX/drive_c" -type f \
+                    \( -iname '*rithmic*trader*.exe' -o -iname '*rtrader*.exe' \) \
+                    -not -iname '*unins*' -not -iname '*setup*' \
+                    2>/dev/null | sort | head -1)"
+        if [[ -z "$exe" ]]; then
+            printf '\033[31m✘\033[0m %s\n' "could not find the executable under $PREFIX/drive_c" >&2
+            echo "  .exe files that ARE there:" >&2
+            find "$PREFIX/drive_c" -type f -iname '*.exe' 2>/dev/null \
+                | grep -viE 'windows/|winsxs' | head -15 | sed 's|^|    |' >&2
+            exit 1
+        fi
         say "Launching $(basename "$exe")"
         exec env WINEPREFIX="$PREFIX" wine "$exe"
         ;;
