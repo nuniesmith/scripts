@@ -213,8 +213,53 @@ install_mono() {
     fi
 }
 
+diagnose() {
+    export WINEPREFIX="$PREFIX"
+    echo "── wine ──────────────────────────────────────────────"
+    echo "  binary   : $(command -v wine || echo MISSING)"
+    echo "  version  : $(wine --version 2>&1 | head -1)"
+    echo "  prefix   : $PREFIX $([[ -d $PREFIX ]] && echo '(exists)' || echo '(MISSING)')"
+    echo "  arch     : $(grep -a '#arch' "$PREFIX/system.reg" 2>/dev/null | head -1)"
+
+    echo "── where wine keeps its appwiz (the file that names the Mono version) ──"
+    local found=false
+    for d in /usr/lib/x86_64-linux-gnu/wine /usr/lib/wine /opt/wine-stable/lib/wine \
+             /opt/wine-devel/lib/wine /usr/lib64/wine; do
+        for f in "$d"/x86_64-unix/appwiz.cpl.so "$d"/i386-unix/appwiz.cpl.so \
+                 "$d"/x86_64-windows/appwiz.cpl "$d"/i386-windows/appwiz.cpl; do
+            [[ -r "$f" ]] || continue
+            found=true
+            printf '  %s\n' "$f"
+            strings "$f" 2>/dev/null | grep -oE 'wine-mono-[0-9]+\.[0-9]+\.[0-9]+' \
+                | sort -u | sed 's/^/      names: /'
+            strings "$f" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -u | head -5 | sed 's/^/      bare versions: /'
+        done
+    done
+    $found || echo "  NONE FOUND — that is why --mono could not work out a version"
+
+    echo "── what is actually installed ────────────────────────"
+    echo "  mono dirs under drive_c:"
+    find "$PREFIX/drive_c" -maxdepth 4 -iname '*mono*' 2>/dev/null | sed 's/^/    /' \
+        | head -10 || true
+    [[ -d "$PREFIX/drive_c/windows/mono" ]] \
+        && echo "    windows/mono EXISTS" || echo "    windows/mono is ABSENT"
+
+    echo "  msi files cached in ~/.cache/wine:"
+    ls -la "$HOME/.cache/wine" 2>/dev/null | sed 's/^/    /' || echo "    (no such directory)"
+
+    echo "── network reachability of the Mono download host ────"
+    if command -v curl >/dev/null; then
+        curl -sSI --max-time 15 https://dl.winehq.org/wine/wine-mono/ 2>&1 \
+            | head -1 | sed 's/^/    /'
+    else
+        echo "    curl is not installed"
+    fi
+}
+
 case "$MODE" in
     check)  check; exit $? ;;
+    diagnose) diagnose; exit 0 ;;
     mono)
         [[ -d "$PREFIX" ]] || die "no prefix at $PREFIX — install first"
         export WINEPREFIX="$PREFIX"
