@@ -6,6 +6,7 @@
 #   ./rtrader-pro.sh --dry-run ~/Downloads/RTraderPro.msi
 #   ./rtrader-pro.sh --launch                            # run it afterwards
 #   ./rtrader-pro.sh --remove                            # delete the prefix
+#   ./rtrader-pro.sh --dotnet the.msi                    # real .NET, if Mono fails
 #
 # WHY A DEDICATED PREFIX. Everything lands in ~/.wine-rithmic, not the default
 # ~/.wine. A trading terminal is not something to debug alongside whatever else
@@ -23,9 +24,21 @@ set -Eeuo pipefail
 PREFIX="${WINEPREFIX_RITHMIC:-$HOME/.wine-rithmic}"
 ARCH="${WINEARCH_RITHMIC:-win64}"
 
-# .NET is the one that actually matters. 4.8 is the last of the Framework line
-# and is what current .NET Framework apps target; override if the installer
-# complains about a specific version.
+# Wine Mono FIRST, real .NET only if that fails.
+#
+# Wine ships Mono, its own .NET Framework implementation, already installed in
+# every new prefix. It costs nothing and handles a good many .NET applications.
+#
+# The alternative — winetricks' dotnet verbs — is not one download. Each version
+# depends on the one before it, so `dotnet472` pulls 462, which pulls 461, which
+# pulls 46, and so on down to dotnet20: roughly ten packages and 500 MB, each
+# needing a working 32-bit stack. On Ubuntu's wine 10.0, which runs the new
+# WoW64 mode with no separate 32-bit binary, it usually fails somewhere in the
+# middle after twenty minutes of downloading.
+#
+# So: try Mono, and only reach for the chain with --dotnet if the app actually
+# refuses to run.
+USE_DOTNET=false
 DOTNET="${RITHMIC_DOTNET:-dotnet48}"
 EXTRAS="${RITHMIC_EXTRAS:-corefonts vcrun2019}"
 
@@ -41,10 +54,11 @@ MSI=""
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
+        --dotnet)  USE_DOTNET=true ;;
         --check)   MODE=check ;;
         --launch)  MODE=launch ;;
         --remove)  MODE=remove ;;
-        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
         -*)        die "unknown option: $arg" ;;
         *)         MSI="$arg" ;;
     esac
@@ -74,8 +88,8 @@ missing_prerequisites() {
 install_hint() {
     if command -v apt-get >/dev/null 2>&1; then
         cat <<'HINT'
-    Debian/Ubuntu — enable 32-bit first, or the .NET install will fail in a
-    way that looks like a Wine bug:
+    Debian/Ubuntu. The i386 line only matters for --dotnet, but adding it now
+    costs nothing and saves a confusing failure later:
 
         sudo dpkg --add-architecture i386
         sudo apt update
@@ -146,10 +160,22 @@ if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
 fi
 
 export WINEPREFIX="$PREFIX"
+# winetricks says it plainly — "32-bit prefixes may work better" — and the .NET
+# installers are 32-bit regardless of the prefix. Only relevant on the --dotnet
+# path; Mono is happy in win64.
+if [[ "$USE_DOTNET" == true && -z "${WINEARCH_RITHMIC:-}" ]]; then
+    ARCH=win32
+fi
 export WINEARCH="$ARCH"
-# The Mono/Gecko prompts are noise here: .NET Framework is installed properly by
-# winetricks below, and Gecko is only needed for embedded browsers.
-export WINEDLLOVERRIDES="mscoree,mshtml="
+
+# Gecko is only needed for embedded browsers and its prompt is noise. mscoree is
+# deliberately NOT overridden here: that disables Wine Mono, which is the whole
+# point of the default path.
+export WINEDLLOVERRIDES="mshtml="
+if [[ "$USE_DOTNET" == true ]]; then
+    # Real .NET replaces Mono, so Mono has to be out of the way for it.
+    export WINEDLLOVERRIDES="mscoree,mshtml="
+fi
 
 if [[ ! -d "$PREFIX" ]]; then
     say "Creating a $ARCH prefix at $PREFIX"
@@ -159,12 +185,21 @@ else
     ok "prefix already exists at $PREFIX (re-running is safe)"
 fi
 
-say "Installing runtimes: $DOTNET $EXTRAS"
-echo "    This is the slow part — .NET takes several minutes and prints alarming"
-echo "    things. Let it finish."
-# shellcheck disable=SC2086
-run winetricks -q $DOTNET $EXTRAS
-ok "runtimes installed"
+if [[ "$USE_DOTNET" == true ]]; then
+    warn "Installing real .NET ($DOTNET) — this pulls EVERY earlier version too"
+    echo "    Roughly ten packages and 500 MB. Twenty minutes on a good line, and"
+    echo "    it can still fail on new-WoW64 Wine. Only worth it if Mono did not"
+    echo "    work. Ctrl-C now if you have not already tried without --dotnet."
+    # shellcheck disable=SC2086
+    run winetricks -q $DOTNET $EXTRAS
+    ok "runtimes installed"
+else
+    say "Using Wine Mono (already present) — no .NET download"
+    echo "    If the app installs but will not start, re-run with --dotnet."
+    # shellcheck disable=SC2086
+    run winetricks -q $EXTRAS
+    ok "fonts and C++ runtime installed"
+fi
 
 say "Running the installer"
 run wine msiexec /i "$(readlink -f "$MSI")"
@@ -181,6 +216,14 @@ cat <<EOF
 
   Launch it with:      $0 --launch
   Start over with:     $0 --remove
+
+  If it installed but will not START, that is Mono not being enough for it:
+
+      $0 --remove
+      $0 --dotnet ~/Downloads/rtraderpro.msi
+
+  which builds a 32-bit prefix and installs the real .NET Framework. Budget
+  half an hour and a few hundred megabytes.
 
   ── the setting you actually came for ──
 
