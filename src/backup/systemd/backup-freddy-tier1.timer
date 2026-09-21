@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightly freddy tier-1 backup
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+RandomizedDelaySec=20m
+# The backup host is not always on. Without this a missed window is simply
+# skipped, and a laptop-shaped gap in the history looks identical to a
+# working backup.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
