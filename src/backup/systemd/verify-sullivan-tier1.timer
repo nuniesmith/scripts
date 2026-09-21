@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly sullivan restore rehearsal
+
+[Timer]
+# Sunday, well after the nightly backup. A backup nobody has restored is a
+# hypothesis, so the rehearsal is scheduled rather than left to good intentions.
+OnCalendar=Sun *-*-* 06:00:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

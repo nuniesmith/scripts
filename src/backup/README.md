@@ -114,3 +114,82 @@ journalctl --user -u backup-freddy-tier1 -n 50
 
 Units live in `systemd/`. The timer runs 03:20 daily with a randomised delay;
 the rehearsal runs weekly, because a backup nobody has restored is a hypothesis.
+
+## sullivan
+
+`backup-sullivan-tier1.sh` / `verify-sullivan-tier1.sh`, same engine (`lib.sh`).
+First archive 290 MB; rehearsal 27 assertions, 0 failures.
+
+Sullivan's volumes are dominated by **cache** — `plex_data` alone is 86 GB of
+artwork and transcode metadata that regenerates itself. What actually hurts is
+small and buried inside those volumes:
+
+- `radarr/sonarr/lidarr.db` — indexers, quality profiles, custom formats and
+  the library index. Months of tuning. (187 movies, 97 series, 72 artists.)
+- `prowlarr.db` + `Definitions/` — every indexer and its credentials.
+- **`qBittorrent/BT_backup`** — 238 `.fastresume` files. Without them a
+  restore re-checks 18 TB against the array before seeding resumes.
+- `com.plexapp.plugins.library.db` — 13,999 items and 537 rows of watch
+  state. Unrecoverable, and the one users notice.
+- compose + `.env` from `/home/jordan/sullivan` and `/home/actions/sullivan`.
+  A backup of every database and none of these restores a pile of data nobody
+  can start.
+
+18 TB of media is **not** covered and is not meant to be. It is re-acquirable;
+a decade of watch history is not.
+
+### Plex needs Plex's own SQLite
+
+Stock `sqlite3` cannot run `PRAGMA integrity_check` on Plex's database — it
+registers a custom FTS tokenizer (`collating`) in its own build, so an
+ordinary SQLite reports `unknown tokenizer: collating`. The page-level
+`.backup` is still faithful (it copies pages and never parses the schema) and
+the row counts still prove real content, but **restoring it needs the
+`Plex SQLite` binary from inside the Plex container**, not `sqlite3`.
+
+### The bug that found: a verifier that failed silently
+
+That tokenizer error aborted the rehearsal under `set -e` — and the script
+**exited 0 with no verdict**, having skipped every remaining check. A caller,
+or a systemd timer, reads that as success. It is the exact hollow green tick
+this tool exists to prevent, in the tool itself.
+
+Both verifiers now set `VERDICT_REACHED` only at the summary; the EXIT trap
+fails loudly if the script ends before it. Every probe carries `|| true` so a
+database that cannot be opened is *reported*, not fatal.
+
+### Assertions must be true of the real system — three times over
+
+The rehearsals rejected three assertions that were simply false:
+
+| assertion | reality |
+|---|---|
+| `authentik applications >= 1` | zero applications configured |
+| `mealie recipes >= 1` | 1 user, zero recipes — installed, unused |
+| `grocy products >= 1` | completely empty — installed, unused |
+
+Each time the backup was faithful and the *check* was wrong. A check that lies
+about the archive is worse than no check, so each was lowered to something
+true and meaningful. Raise them if those services ever get used.
+
+## A third dead service: wiki.js
+
+Same root cause as PhotoPrism, on a different machine. `wiki` crash-loops with
+`Database Connection Error: 28P01` — PostgreSQL's `invalid_password`. Its
+database has **zero tables**, so wiki.js has never successfully initialised.
+
+`POSTGRES_PASSWORD` applies only at first `initdb`. Changing it in compose
+later does nothing to an already-initialised volume, and the app is then
+locked out of its own database forever.
+
+Unlike PhotoPrism this one is safe to fix — there is no data to strand:
+
+```bash
+docker exec wiki-postgres psql -U wikijs -c "ALTER USER wikijs WITH PASSWORD '<compose value>';"
+docker restart wiki
+```
+
+**Check every other service sharing this pattern before assuming two is all
+there are.** authentik and nextcloud are fine (they dump real data), but the
+failure is silent by construction: the app retries forever, the database
+container reports healthy, and nothing alerts.

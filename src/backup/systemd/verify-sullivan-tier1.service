@@ -1,0 +1,8 @@
+[Unit]
+Description=sullivan tier-1 restore rehearsal
+Documentation=https://github.com/nuniesmith/scripts/blob/main/src/backup/README.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/github/scripts/src/backup/verify-sullivan-tier1.sh
+Nice=15

@@ -51,9 +51,20 @@ fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/freddy-verify.XXXXXX")"
 PGNAME="freddy-verify-pg-$$"
+# A verifier that dies early must NEVER look like a pass. Under `set -e` a
+# probe that cannot even open a database ends the run with status 0 and no
+# verdict, and a caller -- or a systemd timer -- reads that as success. This
+# was not hypothetical: the sullivan rehearsal did exactly that on Plex's
+# database, which stock sqlite3 cannot open.
+VERDICT_REACHED=0
 cleanup() {
+  local rc=$?
   docker rm -f "$PGNAME" >/dev/null 2>&1 || true
   rm -rf "$WORK"
+  if [ "$VERDICT_REACHED" -eq 0 ]; then
+    bad "rehearsal ENDED EARLY without a verdict (rc=$rc) -- treat as FAILED"
+    exit 1
+  fi
 }
 trap cleanup EXIT
 
@@ -83,13 +94,14 @@ sqlite_check() {
   integrity="$(python3 -c "
 import sqlite3,sys
 c=sqlite3.connect('file:$WORK/$file?mode=ro',uri=True)
-print(c.execute('PRAGMA integrity_check').fetchone()[0])" 2>&1 | tail -1)"
+print(c.execute('PRAGMA integrity_check').fetchone()[0])" 2>&1 | tail -1 || true)"
   assert "$label integrity" "$integrity" = "ok"
   count="$(python3 -c "
 import sqlite3
 c=sqlite3.connect('file:$WORK/$file?mode=ro',uri=True)
 print(c.execute(\"\"\"$query\"\"\").fetchone()[0])" 2>/dev/null || echo "")"
   assert "$label $what" "$count" -ge "$min"
+  return 0
 }
 
 info "--- SQLite restores"
@@ -187,6 +199,7 @@ tar_has photoprism_curated.tar.gz   "photoprism" 'albums/'
 LIBMETA="$(tar -tzf "$WORK/library_metadata.tar.gz" 2>/dev/null | grep -c 'metadata\.json' || true)"
 assert "library metadata.json files" "$LIBMETA" -ge 50
 
+VERDICT_REACHED=1
 echo
 if [ "$FAIL" -gt 0 ]; then
   bad "REHEARSAL FAILED -- $PASS passed, $FAIL failed"
