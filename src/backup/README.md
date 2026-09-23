@@ -193,3 +193,86 @@ docker restart wiki
 there are.** authentik and nextcloud are fine (they dump real data), but the
 failure is silent by construction: the app retries forever, the database
 container reports healthy, and nothing alerts.
+
+## Tier 2 — archival backup for cold storage
+
+`tier2.py` — chunked `tar.zst` with a searchable content index, sized for
+Glacier Deep Archive.
+
+```bash
+tier2.py plan    --source photos      # chunk plan, nothing written
+tier2.py archive --source nextcloud   # create/update archives
+tier2.py find    IMG_4471             # WHICH archive holds it
+tier2.py verify  photos-2023-06       # sha256 + extract + count
+tier2.py status
+```
+
+### Archives, not files
+
+Syncing individual files to Glacier costs far more than the storage does.
+Glacier bills **40 KB of metadata per archived object** (8 KB at Standard
+rates, 32 KB at Deep Archive rates):
+
+| | 186,587 objects | ~79 archives |
+|---|---:|---:|
+| One-time PUT | $11.20 | $0.02 |
+| Metadata overhead | **7.1 GB/mo** | ~0 |
+| Full restore (Bulk) | $5.92 | $0.80 |
+
+### Two exclusions worth more than the tool
+
+Measuring the sources before archiving cut tier 2 from 158 GB to ~51 GB:
+
+- **`jordan/files/games` — 101.8 GB**, a Clone Hero library of 43,655
+  community chart files. 88% of all Nextcloud bytes, and re-downloadable.
+- **`appdata_*` — 5.3 GB** of Nextcloud previews that regenerate on demand.
+
+Nextcloud went from 114.7 GiB to **7.7 GiB**. At Deep Archive rates
+(Canada Central, $0.0018/GB/mo) the whole of tier 2 is about **$0.09/month**.
+
+At that scale, do not optimise the storage class. Deep Archive is $3.41/yr
+and Flexible Retrieval is $7.68/yr — $4 a year buys retrieval in minutes
+instead of 12 hours.
+
+### The index is the point
+
+Once data is in tarballs in cold storage, "which archive holds IMG_4471?"
+is unanswerable without retrieving things, and a Deep Archive retrieval takes
+12 hours. Every archive gets a manifest; the manifests feed a local SQLite
+index that answers it instantly. **Keep that index out of cold storage.**
+
+Manifests are generated **from the finished archive** (`tar -t`), never from
+a separate walk of the source. A manifest built by listing the source can
+disagree with what actually got archived; one built from the archive cannot.
+
+### Bugs the first real run caught
+
+- **`find` predicates spliced into `du`.** `du -b -d 3 . ! -name appdata_*`
+  is not valid — busybox `du` takes them as paths, matches nothing, and
+  prints nothing. The result was a silent empty plan, not an error.
+- **Excluded data came back as a phantom chunk.** Loose files were computed
+  as `size(parent) − sum(included children)`, so excluding `appdata_*`
+  reappeared as a 5.3 GB "root" chunk that would have been archived anyway.
+  The subtraction has to count *every* child.
+- **Double compression.** `tar -czf` piped into `zstd` produced gzip inside
+  zstd — one wasted pass, worse ratio, and `tar -t` refuses a gzip stream on
+  a pipe (`Archive is compressed. Use -z option`), so every archive failed
+  read-back. Single-pass is also ~1% smaller.
+- **Zero-file chunks.** `du` counts each directory's own inode, so "loose
+  files here" is positive for a directory holding only subdirectories. The
+  file count is the honest test, not the byte count.
+
+### Not Duplicati
+
+Duplicati is installed on sullivan, has been configured, and **has never run
+a job** — it crash-loops unable to decrypt its own settings database. For a
+tool whose whole purpose is to work on the worst day, that is disqualifying
+evidence from this very environment.
+
+`restic` is the better managed alternative if chunk-level incremental proves
+too coarse — it deduplicates and packs small files automatically. Its caveat
+is that index and snapshot objects must stay in warm storage, not Deep
+Archive.
+
+What `tar.zst` buys instead is restore simplicity: `zstd -dc x.tar.zst |
+tar -x`, with no tool version to match and no repository database to rebuild.
