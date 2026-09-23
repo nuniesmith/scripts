@@ -1,0 +1,11 @@
+[Unit]
+Description=sullivan tier-1 backup (databases + config)
+Documentation=https://github.com/nuniesmith/scripts/blob/main/src/backup/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/github/scripts/src/backup/backup-sullivan-tier1.sh
+Nice=10
+IOSchedulingClass=idle
