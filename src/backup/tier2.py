@@ -260,9 +260,17 @@ def archive_chunk(src: Source, chunk: str, size: int, dry: bool) -> str | None:
 
     con = db()
     row = con.execute("SELECT fingerprint FROM archives WHERE name=?", (name,)).fetchone()
-    if row and row[0] == fp:
+    # The fingerprint alone is not enough. It describes the SOURCE; the index
+    # can say "unchanged" long after the archive itself was moved to cold
+    # storage or deleted to free disk. Skipping then produces no archive at
+    # all while reporting success -- a backup run that silently backs up
+    # nothing. Require the artifact to still exist before trusting the skip.
+    if row and row[0] == fp and (DEST / f"{name}.tar.zst").exists():
         print(f"  = {name:44} unchanged ({n_files} files)")
         return None
+    if row and row[0] == fp:
+        print(f"  ! {name:44} index says unchanged but the archive is gone "
+              f"-- rebuilding")
     if dry:
         verb = "would update" if row else "would create"
         print(f"  + {name:44} {verb} ({n_files} files, {size/1024**3:.2f} GiB)")
@@ -430,6 +438,73 @@ def cmd_verify(a):
     print("  VERIFY PASSED")
 
 
+
+def cmd_push(a):
+    """Copy archives to another host, verify there, then optionally free local disk.
+
+    Archives are built on the backup host but are not meant to LIVE there. A
+    second copy on the machine you would restore from is not really a second
+    copy, and 49GB of cold-storage archives sitting on warm disk is what took
+    oryx to 90%.
+
+    S3 is the eventual target; this is host-to-host so the archives can leave
+    today without waiting on credentials.
+    """
+    host, _, remote_dir = a.dest.partition(":")
+    if not remote_dir:
+        sys.exit("dest must look like host:/path")
+
+    files = sorted(DEST.glob("*.tar.zst")) + sorted(DEST.glob("*.manifest.tsv.gz"))
+    idx = DEST / "index.sqlite"
+    if not files:
+        sys.exit(f"nothing to push from {DEST}")
+
+    run(["ssh", "-o", "BatchMode=yes", host, f"mkdir -p {shlex.quote(remote_dir)}"])
+    print(f"  pushing {len(files)} file(s) + index to {a.dest}")
+    # -c makes rsync compare by CHECKSUM, not size+mtime. These archives are
+    # written once and never touched, so a size-and-time match on a corrupt
+    # file would be silently accepted by the default heuristic.
+    r = run(["rsync", "-a", "-c", "--info=progress2", "--", *[str(f) for f in files],
+             str(idx), f"{a.dest.rstrip('/')}/"])
+    if r.returncode != 0:
+        sys.exit(f"rsync failed ({r.returncode}) -- nothing pruned")
+    print("  rsync reported success")
+
+    # rsync exiting 0 is not proof the bytes are readable at the far end.
+    # Re-hash there and compare against what the index recorded.
+    con = db()
+    want = {n: h for n, h in con.execute("SELECT name, sha256 FROM archives")}
+    print(f"  verifying {len(want)} archive checksum(s) on {host}")
+    listed = run(["ssh", "-o", "BatchMode=yes", host,
+                  f"cd {shlex.quote(remote_dir)} && sha256sum *.tar.zst 2>/dev/null"],
+                 capture_output=True, text=True)
+    got = {}
+    for line in listed.stdout.splitlines():
+        h, _, fname = line.partition("  ")
+        got[fname.strip().removesuffix(".tar.zst")] = h.strip()
+
+    bad = [n for n, h in want.items() if got.get(n) != h]
+    missing = [n for n in want if n not in got]
+    if bad or missing:
+        print(f"  FAIL: {len(bad)} checksum mismatch, {len(missing)} missing on {host}")
+        for n in (bad + missing)[:5]:
+            print(f"    {n}")
+        sys.exit("NOT pruning local copies")
+    print(f"  all {len(want)} archives verified byte-identical on {host}")
+
+    if not a.prune_local:
+        print("  local copies kept (pass --prune-local to free the disk)")
+        return
+    freed = sum(f.stat().st_size for f in DEST.glob("*.tar.zst"))
+    for f in DEST.glob("*.tar.zst"):
+        f.unlink()
+    print(f"  pruned local archives, freed {freed/1024**3:.1f} GiB")
+    # The index and manifests STAY. They are a few MB and they are the only
+    # thing that can answer "which archive holds this file?" without pulling
+    # archives back. Losing them turns the remote copy into an opaque pile.
+    print("  index and manifests kept locally on purpose -- they are the map")
+
+
 def cmd_status(a):
     con = db()
     rows = con.execute(
@@ -468,6 +543,12 @@ def main():
     p = sub.add_parser("verify", help="check an archive against the index")
     p.add_argument("name")
     p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("push", help="copy archives to another host and verify there")
+    p.add_argument("--dest", required=True, help="host:/path")
+    p.add_argument("--prune-local", action="store_true",
+                   help="delete local .tar.zst AFTER remote checksums verify")
+    p.set_defaults(fn=cmd_push)
 
     p = sub.add_parser("status", help="what is archived")
     p.set_defaults(fn=cmd_status)
