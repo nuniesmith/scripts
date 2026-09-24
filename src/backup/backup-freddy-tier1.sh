@@ -2,7 +2,7 @@
 # Nightly snapshot of freddy's TIER 1 state: the databases and configuration
 # that cannot be re-downloaded and would take days to rebuild by hand.
 #
-# Tier 1 is deliberately NOT everything on freddy. It is the ~82MB that costs
+# Tier 1 is deliberately NOT everything on freddy. It is the ~350MB that costs
 # the most per byte to lose. The 158GB of photos and Nextcloud files is tier 2
 # and is NOT covered here -- say so out loud rather than letting this script
 # look like full protection.
@@ -44,20 +44,23 @@ trap 'rm -rf "$STAGE"' EXIT
 info "freddy tier-1 backup -> $DEST  (host=$HOST keep=$KEEP)"
 remote true || { fail "cannot reach $HOST over ssh"; exit 1; }
 
-run dump_pg authentik-postgres authentik authentik authentik_pg
+# The source list must follow the stack. A source for a service that has been
+# removed fails every night, and because one failure withholds the whole
+# archive (see finish), it silently stops ALL of freddy's backups. authentik
+# (freddy#16) and photoprism-postgres (freddy#15) were removed on 2026-09-23
+# and took the next two nightly runs down with them.
 run dump_pg nextcloud-postgres nextcloud nextcloud nextcloud_pg
 
-# PhotoPrism is a special case and the reason this script checks content
-# rather than exit codes. It is CONFIGURED for postgres, but as of 2026-09-21
-# that database has zero tables and the app has never connected to it (see the
-# outage note in README.md). Its real index -- every album, label and face ever
-# curated -- is the SQLite left behind at the migration, frozen since
-# 2026-08-25.
-#
-# So back up BOTH: the postgres dump would be a perfectly valid, perfectly
-# empty archive, and shipping only that is precisely how a backup ends up
-# hollow. Once the outage is resolved, whichever store loses is the one to drop.
-run dump_pg photoprism-postgres photoprism photoprism photoprism_pg_EMPTY
+# LifeOS: the Notion replacement, moved here from the Pi on 2026-09-23. Bind
+# mounts under /srv/lifeos, not named volumes. The uploads are content-addressed
+# images the pages embed -- a restore without them is every page with broken
+# images -- and at ~270MB they are most of this archive.
+run dump_pg lifeos-db-1 lifeos_app lifeos lifeos_pg
+run dump_tree /srv/lifeos/data/uploads . lifeos_uploads
+
+# PhotoPrism runs on SQLite since freddy#15 -- it never supported postgres, which
+# is why that database had zero tables. index.db IS the live index now: every
+# album, label and face marker.
 run dump_sqlite freddy_photoprism_storage index.db photoprism_index
 run dump_tree freddy_photoprism_storage . photoprism_curated \
   './cache' './sidecar' './backups' 'index.db*'
@@ -77,9 +80,6 @@ run dump_tree freddy_homeassistant_config . homeassistant_config \
 run dump_tree freddy_audiobookshelf_metadata . audiobookshelf_metadata \
   './cache' './logs' './streams'
 run dump_tree freddy_shelfmark_data . shelfmark_manifests 'shelfmark.db*'
-run dump_tree freddy_authentik_certs     . authentik_certs
-run dump_tree freddy_authentik_templates . authentik_templates
-run dump_tree freddy_authentik_media     . authentik_media
 run dump_tree freddy_uptime_kuma_data docker-tls uptime_kuma_tls
 
 # The per-book metadata.json files inside the (huge, re-downloadable) library.

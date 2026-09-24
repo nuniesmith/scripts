@@ -7,12 +7,14 @@
 # qBittorrent. A check phrased as a prohibition is passed trivially by an empty
 # database, which is how a hollow backup earns a green tick for months.
 #
-# Usage: verify-sullivan-tier1.sh [ARCHIVE]
+# Usage: verify-sullivan-tier1.sh [ARCHIVE]   (default: newest, which must
+#                                              also be recent)
 
 set -euo pipefail
 
 DEST="${BACKUP_DEST:-$HOME/backups/sullivan}"
 ARCHIVE="${1:-}"
+MAX_AGE_HOURS="${VERIFY_MAX_AGE_HOURS:-36}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -30,7 +32,11 @@ assert() {
   fi
 }
 
-[ -n "$ARCHIVE" ] || ARCHIVE="$(ls -1t "$DEST"/sullivan-tier1-*.tar.zst 2>/dev/null | head -1 || true)"
+CHECK_AGE=0
+if [ -z "$ARCHIVE" ]; then
+  ARCHIVE="$(ls -1t "$DEST"/sullivan-tier1-*.tar.zst 2>/dev/null | head -1 || true)"
+  CHECK_AGE=1
+fi
 if [ -z "$ARCHIVE" ] || [ ! -f "$ARCHIVE" ]; then bad "no archive found in $DEST"; exit 1; fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sullivan-verify.XXXXXX")"
@@ -57,6 +63,27 @@ if ( cd "$WORK" && sha256sum --quiet -c <(grep -E '^\s+[0-9a-f]{64}' MANIFEST.tx
   ok "every member matches its recorded sha256"; PASS=$((PASS + 1))
 else
   bad "checksum mismatch -- the archive is corrupt"; FAIL=$((FAIL + 1))
+fi
+
+# Restorable is not enough; the newest archive also has to be NEW. Without
+# this a nightly job that has quietly failed for a week still earns a green
+# rehearsal on whatever it last managed to write -- which is how freddy's
+# stood on 2026-09-24. An archive named on the command line skips this.
+if [ "$CHECK_AGE" -eq 1 ]; then
+  created="$(sed -n 's/^created_utc: *//p' "$WORK/MANIFEST.txt" 2>/dev/null | head -1 || true)"
+  created_epoch=""
+  if [[ "$created" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$ ]]; then
+    created_epoch="$(date -u -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s 2>/dev/null || true)"
+  fi
+  [ -n "$created_epoch" ] || created_epoch="$(stat -c %Y "$ARCHIVE")"
+  age_h=$(( ($(date -u +%s) - created_epoch) / 3600 ))
+  if [ "$age_h" -le "$MAX_AGE_HOURS" ]; then
+    ok "newest archive is ${age_h}h old (<= ${MAX_AGE_HOURS}h)"; PASS=$((PASS + 1))
+  else
+    bad "newest archive is ${age_h}h old (> ${MAX_AGE_HOURS}h) -- the nightly backup has not produced one since"
+    bad "  $(date -u -d "@$created_epoch" '+%Y-%m-%d %H:%M UTC'); check: journalctl --user -u backup-sullivan-tier1"
+    FAIL=$((FAIL + 1))
+  fi
 fi
 
 sq() {  # sq <file> <label> <sql> <what> <min>
