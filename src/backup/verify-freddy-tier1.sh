@@ -7,7 +7,8 @@
 #
 # The rule this script is built around: ASSERT THE POSITIVE CAPABILITY. Every
 # check here demands that specific, named, human-meaningful content comes back
-# -- Kayla's reading progress, real authentik accounts, real Nextcloud users.
+# -- Kayla's reading progress, LifeOS's imported records and the images its
+# pages embed, real Nextcloud users.
 # Checks phrased as prohibitions ("no errors", "file is non-empty") are passed
 # trivially by an empty database, which is exactly how a hollow backup earns a
 # green tick for months.
@@ -17,12 +18,14 @@
 # in a real disaster freddy is what you no longer have.
 #
 # Usage:
-#   verify-freddy-tier1.sh [ARCHIVE]     (default: newest in $BACKUP_DEST)
+#   verify-freddy-tier1.sh [ARCHIVE]     (default: newest in $BACKUP_DEST,
+#                                          which must also be recent)
 
 set -euo pipefail
 
 DEST="${BACKUP_DEST:-$HOME/backups/freddy}"
 ARCHIVE="${1:-}"
+MAX_AGE_HOURS="${VERIFY_MAX_AGE_HOURS:-36}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -42,15 +45,19 @@ assert() {  # assert <description> <actual> <predicate: -ge N | = STR>
   bad "$what: got '${actual:-<nothing>}', wanted $op $want"; FAIL=$((FAIL + 1)); return 0
 }
 
+CHECK_AGE=0
 if [ -z "$ARCHIVE" ]; then
   ARCHIVE="$(ls -1t "$DEST"/freddy-tier1-*.tar.zst 2>/dev/null | head -1 || true)"
+  CHECK_AGE=1
 fi
 if [ -z "$ARCHIVE" ] || [ ! -f "$ARCHIVE" ]; then
   bad "no archive found (looked in $DEST)"; exit 1
 fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/freddy-verify.XXXXXX")"
-PGNAME="freddy-verify-pg-$$"
+# One throwaway per postgres MAJOR version -- see the postgres section.
+PG16="freddy-verify-pg16-$$"
+PG17="freddy-verify-pg17-$$"
 # A verifier that dies early must NEVER look like a pass. Under `set -e` a
 # probe that cannot even open a database ends the run with status 0 and no
 # verdict, and a caller -- or a systemd timer -- reads that as success. This
@@ -59,7 +66,7 @@ PGNAME="freddy-verify-pg-$$"
 VERDICT_REACHED=0
 cleanup() {
   local rc=$?
-  docker rm -f "$PGNAME" >/dev/null 2>&1 || true
+  docker rm -f "$PG16" "$PG17" >/dev/null 2>&1 || true
   rm -rf "$WORK"
   if [ "$VERDICT_REACHED" -eq 0 ]; then
     bad "rehearsal ENDED EARLY without a verdict (rc=$rc) -- treat as FAILED"
@@ -81,6 +88,29 @@ if [ -f "$WORK/MANIFEST.txt" ]; then
   fi
 else
   warn "no MANIFEST.txt in archive"
+fi
+
+# ---------------------------------------------------------------- freshness
+# Restorable is not enough; the newest archive also has to be NEW. On
+# 2026-09-24 the nightly job had failed two nights running and the newest
+# archive was 48 hours old -- and this rehearsal would have passed it, because
+# it took "newest" without asking how new that was. An archive named on the
+# command line skips this: rehearsing an old one on purpose is legitimate.
+if [ "$CHECK_AGE" -eq 1 ]; then
+  created="$(sed -n 's/^created_utc: *//p' "$WORK/MANIFEST.txt" 2>/dev/null | head -1 || true)"
+  created_epoch=""
+  if [[ "$created" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$ ]]; then
+    created_epoch="$(date -u -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s 2>/dev/null || true)"
+  fi
+  [ -n "$created_epoch" ] || created_epoch="$(stat -c %Y "$ARCHIVE")"
+  age_h=$(( ($(date -u +%s) - created_epoch) / 3600 ))
+  if [ "$age_h" -le "$MAX_AGE_HOURS" ]; then
+    ok "newest archive is ${age_h}h old (<= ${MAX_AGE_HOURS}h)"; PASS=$((PASS + 1))
+  else
+    bad "newest archive is ${age_h}h old (> ${MAX_AGE_HOURS}h) -- the nightly backup has not produced one since"
+    bad "  $(date -u -d "@$created_epoch" '+%Y-%m-%d %H:%M UTC'); check: journalctl --user -u backup-freddy-tier1"
+    FAIL=$((FAIL + 1))
+  fi
 fi
 
 # ---------------------------------------------------------------- sqlite
@@ -133,50 +163,63 @@ sqlite_check homeassistant.sqlite "homeassistant" \
 # A real restore into a real, throwaway postgres. Reading the dump's table of
 # contents would prove the file parses; only restoring it proves the schema
 # and data actually load.
-info "--- PostgreSQL restores (throwaway container)"
-docker rm -f "$PGNAME" >/dev/null 2>&1 || true
-docker run -d --name "$PGNAME" -e POSTGRES_PASSWORD=rehearsal \
-  -e POSTGRES_USER=rehearsal -e POSTGRES_DB=rehearsal \
-  postgres:16-alpine >/dev/null
-for _ in $(seq 1 45); do
-  docker exec "$PGNAME" pg_isready -U rehearsal >/dev/null 2>&1 && break
-  sleep 1
-done
-if ! docker exec "$PGNAME" pg_isready -U rehearsal >/dev/null 2>&1; then
-  bad "throwaway postgres never came up"; FAIL=$((FAIL + 1))
-else
-  ok "throwaway postgres ready"
+#
+# Each dump restores into the MAJOR VERSION it was taken from: nextcloud runs
+# postgres 16, LifeOS runs 17, and pg_restore refuses a dump from a newer
+# pg_dump. One shared throwaway would either fail the LifeOS restore outright
+# or, bumped to 17, rehearse nextcloud against a server it never runs on.
+info "--- PostgreSQL restores (throwaway containers)"
+start_pg() {  # start_pg <container> <image> -- 0 once it accepts connections
+  local name="$1" image="$2"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" -e POSTGRES_PASSWORD=rehearsal \
+    -e POSTGRES_USER=rehearsal -e POSTGRES_DB=rehearsal "$image" >/dev/null 2>&1 || true
+  for _ in $(seq 1 45); do
+    docker exec "$name" pg_isready -U rehearsal >/dev/null 2>&1 && break
+    sleep 1
+  done
+  if ! docker exec "$name" pg_isready -U rehearsal >/dev/null 2>&1; then
+    bad "throwaway $image never came up"; FAIL=$((FAIL + 1)); return 1
+  fi
+  ok "throwaway $image ready"
+}
 
-  pg_check() {
-    local file="$1" label="$2" dbname="$3" query="$4" what="$5" min="$6"
-    if [ ! -f "$WORK/$file" ]; then bad "$label: missing"; FAIL=$((FAIL + 1)); return; fi
-    docker exec "$PGNAME" psql -U rehearsal -d rehearsal -qc \
-      "DROP DATABASE IF EXISTS $dbname;" >/dev/null 2>&1
-    docker exec "$PGNAME" psql -U rehearsal -d rehearsal -qc \
-      "CREATE DATABASE $dbname;" >/dev/null 2>&1
-    # pg_restore warns about ownership on a database whose roles do not exist
-    # here; that is expected in a rehearsal and not a restore failure, so the
-    # verdict comes from the row counts below rather than from its exit code.
-    docker exec -i "$PGNAME" pg_restore -U rehearsal -d "$dbname" --no-owner --no-acl \
-      < "$WORK/$file" >/dev/null 2>&1 || true
-    local count
-    count="$(docker exec "$PGNAME" psql -U rehearsal -d "$dbname" -tAc "$query" 2>/dev/null | tr -d '[:space:]')"
-    assert "$label $what" "$count" -ge "$min"
-  }
+# restore_pg <container> <dumpfile> <dbname>
+# pg_restore warns about ownership on a database whose roles do not exist
+# here; that is expected in a rehearsal and not a restore failure, so the
+# verdict comes from the row counts that follow rather than its exit code.
+restore_pg() {
+  local ctr="$1" file="$2" dbname="$3"
+  if [ ! -f "$WORK/$file" ]; then bad "$file: missing from archive"; FAIL=$((FAIL + 1)); return 1; fi
+  docker exec "$ctr" psql -U rehearsal -d rehearsal -qc \
+    "DROP DATABASE IF EXISTS $dbname;" >/dev/null 2>&1 || true
+  docker exec "$ctr" psql -U rehearsal -d rehearsal -qc \
+    "CREATE DATABASE $dbname;" >/dev/null 2>&1 || true
+  docker exec -i "$ctr" pg_restore -U rehearsal -d "$dbname" --no-owner --no-acl \
+    < "$WORK/$file" >/dev/null 2>&1 || true
+}
 
-  pg_check authentik_pg.dump "authentik" authentik_r \
-    "SELECT count(*) FROM authentik_core_user;" "accounts" 1
-  # Flows, not applications. This authentik has 3 users and ZERO applications
-  # configured (verified live on 2026-09-21), so asserting applications >= 1
-  # would fail on a perfectly faithful backup -- a check that lies about the
-  # archive is worse than no check. Flows are created by authentik itself and
-  # so are a real signal that the schema and its data both loaded.
-  pg_check authentik_pg.dump "authentik" authentik_r2 \
-    "SELECT count(*) FROM authentik_flows_flow;" "flows" 1
-  pg_check nextcloud_pg.dump "nextcloud" nextcloud_r \
-    "SELECT count(*) FROM oc_users;" "users" 1
-  pg_check nextcloud_pg.dump "nextcloud" nextcloud_r2 \
-    "SELECT count(*) FROM oc_filecache;" "indexed files" 100
+pg_assert() {  # pg_assert <container> <dbname> <label> <query> <what> <min>
+  local ctr="$1" dbname="$2" label="$3" query="$4" what="$5" min="$6" count
+  count="$(docker exec "$ctr" psql -U rehearsal -d "$dbname" -tAc "$query" 2>/dev/null | tr -d '[:space:]' || true)"
+  assert "$label $what" "$count" -ge "$min"
+}
+
+if start_pg "$PG16" postgres:16-alpine && restore_pg "$PG16" nextcloud_pg.dump nextcloud_r; then
+  pg_assert "$PG16" nextcloud_r nextcloud "SELECT count(*) FROM oc_users;" "users" 1
+  pg_assert "$PG16" nextcloud_r nextcloud "SELECT count(*) FROM oc_filecache;" "indexed files" 100
+fi
+
+# LifeOS: 448 records imported from Notion. `attachments` is what the pages
+# embed; its storage keys are cross-checked against the uploads tar below, so
+# the images have to come back too, not merely rows that point at them.
+if start_pg "$PG17" postgres:17-bookworm && restore_pg "$PG17" lifeos_pg.dump lifeos_r; then
+  pg_assert "$PG17" lifeos_r lifeos "SELECT count(*) FROM source_records;" "imported records" 200
+  pg_assert "$PG17" lifeos_r lifeos "SELECT count(*) FROM attachments;" "attachments" 200
+  pg_assert "$PG17" lifeos_r lifeos "SELECT count(*) FROM users;" "users" 1
+  docker exec "$PG17" psql -U rehearsal -d lifeos_r -tAc \
+    "SELECT storage_key FROM attachments WHERE archived_at IS NULL;" \
+    > "$WORK/lifeos_keys.txt" 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------- tarballs
@@ -198,6 +241,25 @@ tar_has photoprism_curated.tar.gz   "photoprism" 'albums/'
 
 LIBMETA="$(tar -tzf "$WORK/library_metadata.tar.gz" 2>/dev/null | grep -c 'metadata\.json' || true)"
 assert "library metadata.json files" "$LIBMETA" -ge 50
+
+# LifeOS uploads are content-addressed (`ab/cd/<sha256>.png`), so every
+# attachment row names exactly one file. Zero missing is only meaningful
+# because the restore above already demanded >= 200 attachment rows; an
+# empty key list is reported as a failure rather than trivially "nothing
+# missing".
+if [ -f "$WORK/lifeos_uploads.tar.gz" ]; then
+  tar -tzf "$WORK/lifeos_uploads.tar.gz" 2>/dev/null | sed 's#^\./##' | grep -v '/$' \
+    | sort > "$WORK/lifeos_files.txt" || true
+  assert "lifeos upload files" "$(wc -l < "$WORK/lifeos_files.txt")" -ge 200
+  if [ -s "$WORK/lifeos_keys.txt" ]; then
+    missing="$(sort "$WORK/lifeos_keys.txt" | sed '/^$/d' | comm -23 - "$WORK/lifeos_files.txt" | wc -l || true)"
+    assert "lifeos attachments whose file is missing" "$missing" = "0"
+  else
+    bad "lifeos: no attachment keys came back from the restore to cross-check"; FAIL=$((FAIL + 1))
+  fi
+else
+  bad "lifeos_uploads.tar.gz: missing from archive"; FAIL=$((FAIL + 1))
+fi
 
 VERDICT_REACHED=1
 echo

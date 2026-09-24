@@ -15,16 +15,18 @@
 ```
 
 Defaults: `BACKUP_DEST=~/backups/freddy`, `BACKUP_HOST=freddy`, `BACKUP_KEEP=14`.
-First archive: 34 MB compressed from ~82 MB staged.
+First archive: 34 MB compressed from ~82 MB staged. Since LifeOS joined
+(2026-09-24): ~300 MB from ~350 MB, nearly all of it LifeOS's uploads, which
+are PNG/WebP and do not compress further.
 
 ## Why these files and not others
 
-Tier 1 is the ~190 MB that costs the most **per byte** to lose. It is explicitly
+Tier 1 is the ~350 MB that costs the most **per byte** to lose. It is explicitly
 **not** full protection for freddy:
 
 | tier | what | size | covered |
 |---|---|---|---|
-| 1 | databases + config + curated metadata | ~82 MB | **yes** |
+| 1 | databases + config + curated metadata + LifeOS uploads | ~350 MB | **yes** |
 | 2 | Nextcloud files, PhotoPrism originals | ~158 GB | **no** |
 | 3 | audiobook/ebook library | ~80 GB | no — re-downloadable, that is what shelfmark is for |
 
@@ -64,9 +66,40 @@ reports itself corrupt. Caught by the rehearsal on the first run.
 **The rehearsal asserts positive capability.** `PRAGMA integrity_check` proves
 the file is sound; it does not prove it is the *right* file — a pristine empty
 database passes it. So every check demands named content: 190 library items,
-Kayla's `mediaProgresses` rows, `reconciled_torrents`, real authentik accounts,
-`oc_filecache` rows. Checks phrased as prohibitions are passed trivially by
-empty data, which is how a hollow backup earns a green tick for months.
+Kayla's `mediaProgresses` rows, `reconciled_torrents`, LifeOS's imported
+records, `oc_filecache` rows. LifeOS goes one further: every attachment the
+restored database names must have its file in the uploads tar, so the pages'
+images come back rather than rows pointing at nothing. Checks phrased as
+prohibitions are passed trivially by empty data, which is how a hollow backup
+earns a green tick for months.
+
+**Postgres dumps restore into the major version they came from.** nextcloud
+runs 16 and LifeOS runs 17; `pg_restore` refuses a dump from a newer
+`pg_dump`, so the rehearsal starts one throwaway per version.
+
+**The newest archive must also be recent.** When the rehearsal picks the
+archive itself, it fails if that archive is older than 36 hours
+(`VERIFY_MAX_AGE_HOURS`). See the next section for why.
+
+## The source list must follow the stack
+
+On 2026-09-23 authentik (freddy#16) and `photoprism-postgres` (freddy#15) were
+removed from freddy. This script still dumped both, so every nightly run failed
+on a container that no longer existed, and because one failed source withholds
+the whole archive, **freddy had no new backup for two nights** — from
+2026-09-22 07:21 to 2026-09-24 08:02 UTC. Nothing said so: the unit sat in
+`failed`, the timer read "active (waiting)", and a status check that looked at
+the timers called them armed. Meanwhile LifeOS moved onto freddy and was in no
+backup at all.
+
+Two things would have caught it, and both are now true:
+
+- the rehearsal checks the age of the newest archive, so a job that keeps
+  failing cannot keep earning a green rehearsal on its last success;
+- the rule: **a change that removes a service from a host removes its sources
+  here in the same change, and a change that adds a stateful service adds
+  them.** Fail-closed is right, but it means a stale source list takes down the
+  whole host's backup, not just the missing piece.
 
 **Assertions must be true of the real system.** The first rehearsal failed on
 `authentik applications >= 1`. Live authentik has zero applications configured,
@@ -76,6 +109,12 @@ check that lies about the archive is worse than no check.
 ## Two outages this work uncovered
 
 ### PhotoPrism has been down since roughly 2026-08-25
+
+**Resolved 2026-09-23 (freddy#15).** The password diagnosis below was a red
+herring: this PhotoPrism build supports only SQLite and MariaDB
+(`sql: unknown driver "postgres"`), so it never tried to connect at all. It
+runs on the SQLite index now, `photoprism-postgres` is gone, and the backup
+captures `index.db` alone. Kept for the record:
 
 `docker ps` reports it **healthy**. It is not. It has been sitting in
 `config: waiting for the database to become available` continuously.
@@ -114,6 +153,11 @@ journalctl --user -u backup-freddy-tier1 -n 50
 
 Units live in `systemd/`. The timer runs 03:20 daily with a randomised delay;
 the rehearsal runs weekly, because a backup nobody has restored is a hypothesis.
+
+**The units run the scripts straight out of `~/github/scripts`**, so the
+nightly job runs whatever branch that checkout is on. Keep it on `main` and
+develop in a worktree (`git worktree add ../scripts-wt -b my-branch`); on
+2026-09-24 it was found sitting on an already-merged feature branch.
 
 ## sullivan
 
