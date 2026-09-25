@@ -1,0 +1,7 @@
+[Unit]
+Description=Tell Discord that %i failed
+Documentation=https://github.com/nuniesmith/scripts/blob/main/src/backup/README.md
+
+[Service]
+Type=oneshot
+ExecStart=%h/github/scripts/src/backup/notify-failure.sh %i

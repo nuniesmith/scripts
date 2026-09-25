@@ -146,10 +146,31 @@ is worse than an empty slot, because it stops anyone asking the question.
 ## Install
 
 ```bash
-systemctl --user enable --now backup-freddy-tier1.timer
-systemctl --user list-timers backup-freddy-tier1.timer
+./systemd/install.sh                       # copies every unit, reloads, enables the timers
+systemctl --user list-units --failed       # the health check -- NOT list-timers
 journalctl --user -u backup-freddy-tier1 -n 50
 ```
+
+The units are copies in `~/.config/systemd/user`, so a change merged here
+reaches systemd only when `install.sh` runs again.
+
+## Alerts
+
+Every backup and rehearsal unit has `OnFailure=notify-failure@%n.service`,
+which posts the failed unit and its last log lines to Discord through the
+webhook in `~/.config/homelab/discord-webhook` (one line, mode 600; the same
+file Uptime-Kuma's notification is provisioned from). `notify-failure.sh
+--test` sends a test message.
+
+This exists because a failed unit alerts no one by itself: freddy's nightly
+backup failed two nights running (2026-09-23/24) while its timer read `active
+(waiting)`. The alert path fails loudly too -- no webhook file, or Discord not
+answering 204, exits non-zero with "alerts NOBODY" / "NOT delivered", which
+leaves the notify unit itself in `--failed`.
+
+Verified 2026-09-25: test message delivered; a drill unit that failed on
+purpose delivered its alert through `OnFailure=`; a missing and a rejected
+webhook both exit 1.
 
 Units live in `systemd/`. The timer runs 03:20 daily with a randomised delay;
 the rehearsal runs weekly, because a backup nobody has restored is a hypothesis.

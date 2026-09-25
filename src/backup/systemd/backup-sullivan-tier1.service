@@ -3,6 +3,8 @@ Description=sullivan tier-1 backup (databases + config)
 Documentation=https://github.com/nuniesmith/scripts/blob/main/src/backup/README.md
 After=network-online.target
 Wants=network-online.target
+# A failure nobody sees is how freddy went two nights without a backup.
+OnFailure=notify-failure@%n.service
 
 [Service]
 Type=oneshot

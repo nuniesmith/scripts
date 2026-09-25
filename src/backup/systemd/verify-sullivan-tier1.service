@@ -1,6 +1,8 @@
 [Unit]
 Description=sullivan tier-1 restore rehearsal
 Documentation=https://github.com/nuniesmith/scripts/blob/main/src/backup/README.md
+# A failure nobody sees is how freddy went two nights without a backup.
+OnFailure=notify-failure@%n.service
 
 [Service]
 Type=oneshot
