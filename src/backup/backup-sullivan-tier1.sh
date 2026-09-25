@@ -90,7 +90,6 @@ run dump_tree sullivan_qbittorrent_data qBittorrent qbittorrent_config \
 run dump_tree sullivan_recyclarr_data   . recyclarr_config './repositories' './logs' '*.log'
 run dump_tree sullivan_prowlarr_data    Definitions prowlarr_definitions
 run dump_tree sullivan_tdarr_server_data . tdarr_config './logs' './Tdarr/Logs' '*.log'
-run dump_tree sullivan_seerr_data       . seerr_config './logs' '*.log' '.machinelogs*'
 run dump_tree sullivan_dispatcharr_data . dispatcharr_config './logs' '*.log'
 
 # --- how the stack is assembled -----------------------------------------
