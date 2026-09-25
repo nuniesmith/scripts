@@ -92,8 +92,6 @@ run dump_tree sullivan_prowlarr_data    Definitions prowlarr_definitions
 run dump_tree sullivan_tdarr_server_data . tdarr_config './logs' './Tdarr/Logs' '*.log'
 run dump_tree sullivan_seerr_data       . seerr_config './logs' '*.log' '.machinelogs*'
 run dump_tree sullivan_dispatcharr_data . dispatcharr_config './logs' '*.log'
-run dump_tree sullivan_jellyfin_data    . jellyfin_config \
-  './cache' './log' './logs' './metadata' './transcodes' './data/subtitles'
 
 # --- how the stack is assembled -----------------------------------------
 # A backup of every database and none of the compose files restores a pile of
