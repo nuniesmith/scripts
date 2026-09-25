@@ -23,9 +23,9 @@ tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 # The trailing "" means NO arguments; without it sudo would allow any.
 printf '%s ALL=(root) NOPASSWD: %s ""\n' "$user" "$target" >"$tmp"
-visudo -cqf "$tmp"
+visudo -cqf "$tmp" >/dev/null
 install -o root -g root -m 0440 "$tmp" "$rule"
-visudo -cq
+visudo -cq >/dev/null
 
 # Prove what was granted rather than trusting the file. Positive capability
 # first: a rule that grants nothing would pass every "cannot" check below.
