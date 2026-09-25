@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# homelab-apt-upgrade -- apt update + upgrade, for the daily update workflow.
+#
+# Installed root-owned at /usr/local/sbin/homelab-apt-upgrade by install.sh in
+# this directory, together with the ONE sudoers rule that lets the deploy user
+# run it:
+#
+#     actions ALL=(root) NOPASSWD: /usr/local/sbin/homelab-apt-upgrade ""
+#
+# The "" forbids arguments: the deploy user can start an upgrade and collect
+# its report, and nothing else as root. (It is in the docker group, which is
+# root-equivalent anyway -- this is about the workflow not needing more than
+# it uses, not about containing it.)
+#
+# WHY A SYSTEMD UNIT
+# ------------------
+# The upgrade runs as a transient unit, not as a child of the SSH session that
+# asked for it. Upgrading tailscale restarts the tunnel that very session
+# arrives through, and a dpkg killed halfway leaves the host needing
+# `dpkg --configure -a` by hand. If the session drops, running this again
+# attaches to the upgrade still in progress -- or, if it has finished, prints
+# the report nobody collected -- rather than starting a second one.
+#
+# WHAT IT WILL NOT DO
+# -------------------
+#   - reboot. It reports when one is needed.
+#   - remove packages (upgrade --with-new-pkgs, never full-upgrade/autoremove).
+#   - restart services: needrestart runs in list mode, so a library update
+#     cannot bounce dockerd (and every container on a host without
+#     live-restore) as a side effect. The report names what is still running
+#     old code instead.
+#   - overwrite a config file you edited (--force-confold).
+#
+# OUTPUT: key=value report lines on stdout, progress on stderr. Exit 0 when the
+# upgrade succeeded (result=ok or result=warn), 1 when it failed.
+set -euo pipefail
+
+UNIT=homelab-apt-upgrade
+SELF=/usr/local/sbin/homelab-apt-upgrade
+STATE=/var/lib/homelab-apt-upgrade
+LOG="$STATE/log"
+WAIT_LIMIT=${WAIT_LIMIT:-3300}   # seconds the client waits; the unit itself is capped at 3600
+
+# ---------------------------------------------------------------------------
+# worker: the upgrade itself, run by systemd as the transient unit
+# ---------------------------------------------------------------------------
+worker() {
+    # Only systemd sets INVOCATION_ID. Refuse to run the upgrade any other way,
+    # so it can never end up tied to someone's terminal after all.
+    [ -n "${INVOCATION_ID:-}" ] || { echo "--worker runs under systemd only" >&2; exit 2; }
+    umask 022
+    rm -f "$STATE/rc" "$STATE/report" "$STATE/collected"
+    : >"$LOG"
+
+    # C locale: the report parses apt's English wording, and `join` needs
+    # the same collation that sorted its inputs.
+    export LC_ALL=C DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+    local apt=(apt-get -q -y -o DPkg::Lock::Timeout=900
+               -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+    # Output goes to the log file AND this unit's journal.
+    step() { echo "+ $*" | tee -a "$LOG"; "$@" 2>&1 | tee -a "$LOG"; return "${PIPESTATUS[0]}"; }
+    installed() {
+        dpkg-query -W -f '${db:Status-Abbrev}\t${binary:Package}\t${Version}\n' \
+            | awk -F'\t' '$1 ~ /^ii/ {print $2" "$3}' | sort
+    }
+
+    local result=ok rc=0 warnings=()
+    # An upgrade interrupted on an earlier day blocks every later one.
+    if ! step dpkg --configure -a; then
+        result=failed; rc=1; warnings+=("dpkg --configure -a failed")
+    fi
+    if [ "$result" = ok ] && ! step "${apt[@]}" update; then
+        # One unreachable third-party source should not hold back the rest;
+        # the upgrade goes ahead with the lists that did download.
+        result=warn; warnings+=("apt-get update reported errors; some sources may be stale")
+    fi
+    installed >"$STATE/before"
+    if [ "$result" != failed ] && ! step "${apt[@]}" --with-new-pkgs upgrade; then
+        result=failed; rc=1; warnings+=("apt-get upgrade failed")
+    fi
+    installed >"$STATE/after"
+
+    local changed added kept reboot stale kernel
+    changed=$(join "$STATE/before" "$STATE/after" | awk '$2 != $3 {printf "%s%s %s→%s", sep, $1, $2, $3; sep=", "}')
+    added=$(join -v2 "$STATE/before" "$STATE/after" | awk '{printf "%s%s %s", sep, $1, $2; sep=", "}')
+    # apt lists these under a header, indented, possibly over several lines.
+    kept=$(awk '/have been kept back:|deferred due to phasing:/ {grab=1; next}
+                grab && /^  / {printf "%s%s", sep, substr($0, 3); sep=" "; next}
+                {grab=0}' "$LOG" | tr -s ' ')
+    reboot=$(sort -u /var/run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ' | sed 's/ $//' || true)
+    if [ -f /var/run/reboot-required ] && [ -z "$reboot" ]; then reboot="(no package named)"; fi
+    stale=$(needrestart -b -r l 2>/dev/null | awk '/^NEEDRESTART-SVC:/ {printf "%s%s", sep, $2; sep=" "}' || true)
+    kernel=$(needrestart -b -r l 2>/dev/null | awk '/^NEEDRESTART-KCUR:/ {c=$2} /^NEEDRESTART-KEXP:/ {e=$2}
+                END {if (c != "" && e != "" && c != e) print "running " c ", installed " e}' || true)
+
+    {
+        echo "result=$result"
+        echo "upgraded=$(join "$STATE/before" "$STATE/after" | awk '$2 != $3' | wc -l)"
+        echo "installed=$(join -v2 "$STATE/before" "$STATE/after" | wc -l)"
+        echo "changes=$changed"
+        echo "new=$added"
+        echo "kept_back=$kept"
+        echo "reboot=$reboot"
+        echo "kernel=$kernel"
+        echo "stale_services=$stale"
+        echo "warnings=$(IFS=';'; echo "${warnings[*]:-}")"
+        if [ "$result" = failed ]; then
+            echo "log_tail=$(tail -n 15 "$LOG" | tr '\n' '|' | cut -c1-1500)"
+        fi
+    } >"$STATE/report.tmp"
+    mv "$STATE/report.tmp" "$STATE/report"
+    # rc is written LAST: a client treats its presence as "the report is complete".
+    echo "$rc" >"$STATE/rc.tmp" && mv "$STATE/rc.tmp" "$STATE/rc"
+    echo "homelab-apt-upgrade: result=$result"
+}
+
+# ---------------------------------------------------------------------------
+# client: start the unit (or attach to one), wait, print its report
+# ---------------------------------------------------------------------------
+client() {
+    [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo $SELF)" >&2; exit 2; }
+    install -d -m 0755 "$STATE"
+
+    if systemctl is-active --quiet "$UNIT"; then
+        echo "attaching to the apt upgrade already running" >&2
+    elif [ -f "$STATE/rc" ] && [ ! -f "$STATE/collected" ]; then
+        echo "collecting an apt upgrade that finished while nobody was attached" >&2
+    else
+        echo "starting apt upgrade as $UNIT.service (journalctl -u $UNIT)" >&2
+        # Lost a race with another client: attach to its unit instead.
+        systemd-run --quiet --collect --unit="$UNIT" \
+            --description="apt upgrade for the daily update workflow" \
+            -p RuntimeMaxSec=3600 "$SELF" --worker \
+            || systemctl is-active --quiet "$UNIT" \
+            || { echo "could not start $UNIT" >&2; exit 1; }
+    fi
+
+    local waited=0
+    while systemctl is-active --quiet "$UNIT"; do
+        if [ "$waited" -ge "$WAIT_LIMIT" ]; then
+            echo "result=failed"
+            echo "warnings=still running after ${WAIT_LIMIT}s; left running (journalctl -u $UNIT)"
+            exit 1
+        fi
+        sleep 5; waited=$((waited + 5))
+    done
+
+    if [ ! -f "$STATE/rc" ]; then
+        echo "result=failed"
+        echo "warnings=the upgrade ended without writing a report (journalctl -u $UNIT)"
+        exit 1
+    fi
+    cat "$STATE/report"
+    touch "$STATE/collected"
+    exit "$(cat "$STATE/rc")"
+}
+
+case "${1:-}" in
+    --worker) worker ;;
+    "") client ;;
+    *) echo "usage: $SELF   (no arguments)" >&2; exit 2 ;;
+esac
