@@ -1,5 +1,60 @@
 # scripts
 
+## Media cleanup on Sullivan
+
+`src/utils/media_cleanup.py` previews deletion candidates by default. It uses
+filesystem timestamps, **not playback history**: `noatime`/`relatime` mounts and
+application access patterns make timestamps unsuitable for deciding what is
+unwatched. The default media age uses the newer of access and modification time;
+`--use-mtime` uses modification time only. Both age limits must be positive days.
+
+```bash
+# Preview only; inspect every proposed deletion.
+python3 src/utils/media_cleanup.py --media-only
+
+# Permanent media deletion requires explicit acknowledgment of the age policy.
+python3 src/utils/media_cleanup.py --media-only --execute --confirm-filesystem-age
+```
+
+qBittorrent cleanup is **disabled by default**. The old live incomplete, complete,
+and shelfmark directories are no longer scanned. Supply `--qb-dir DIRECTORY`
+(repeatable, replacing configured directories) or configure `QB_INCOMPLETE_DIRS`
+with directories containing only confirmed abandoned files. Before using them,
+verify these files are no longer tracked by qBittorrent or awaiting import.
+The script does not query qBittorrent; age and partial extensions cannot establish
+that a download is abandoned. Paused/stalled torrents are not abandoned merely
+because they have an old modification time.
+
+```bash
+# Replace this example path with your dedicated abandoned-file directory.
+python3 src/utils/media_cleanup.py --qb-only --qb-dir /path/to/abandoned-files
+python3 src/utils/media_cleanup.py --qb-only --qb-dir /path/to/abandoned-files \
+  --execute --confirm-qb-abandoned
+```
+
+Only old `.!qB`, `.parts`, `.!ut`, `.tmp`, and `.partial` files qualify for
+qBittorrent cleanup (case-insensitive). Completed media files do not qualify.
+An execution that includes both media and configured qBittorrent directories
+requires both confirmation flags. `--dry-run` and `--execute` are mutually
+exclusive, as are `--media-only` and `--qb-only`.
+
+**Stop writers and importers before execution.** Files are revalidated immediately
+before deletion, but concurrent writes/renames can still race with unlinking.
+Symlinked paths, nonregular files, changed files, and hardlinked files are skipped.
+Deletion is permanent; maintain backups. There is no quarantine or undo feature.
+
+`--target-free-gb N` (or `TARGET_FREE_GB`) skips deletion on each filesystem once
+its actual available space reaches N GiB; zero disables the target. Dry-run checks
+current free space but does not simulate future space gains. Totals report logical
+file sizes, not reclaimed disk space (sparse files and filesystem snapshots can
+make them differ).
+
+Run isolated cleanup tests without touching your media or contacting services:
+
+```bash
+python3 -B -m unittest discover -s tests -p 'test_media_cleanup.py' -v
+```
+
 ## Generate server secrets
 
 Download the raw script and run it as root:
