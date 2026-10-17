@@ -55,7 +55,11 @@ run dump_pg nextcloud-postgres nextcloud nextcloud nextcloud_pg
 # mounts under /srv/lifeos, not named volumes. The uploads are content-addressed
 # images the pages embed -- a restore without them is every page with broken
 # images -- and at ~270MB they are most of this archive.
-run dump_pg lifeos-db-1 lifeos_app lifeos lifeos_pg
+#
+# LifeOS's 2026-10-09 rebuild renamed its container (lifeos-db-1 -> lifeos-db)
+# and superuser (lifeos_app -> lifeos). The old names failed every run from
+# 2026-10-10 and, by the rule above, withheld EVERY freddy archive for a week.
+run dump_pg lifeos-db lifeos lifeos lifeos_pg
 run dump_tree /srv/lifeos/data/uploads . lifeos_uploads
 
 # PhotoPrism runs on SQLite since freddy#15 -- it never supported postgres, which
