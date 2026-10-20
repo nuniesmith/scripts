@@ -7,8 +7,8 @@
 #
 # The rule this script is built around: ASSERT THE POSITIVE CAPABILITY. Every
 # check here demands that specific, named, human-meaningful content comes back
-# -- Kayla's reading progress, LifeOS's imported records and the images its
-# pages embed, real Nextcloud users.
+# -- Kayla's reading progress, real Nextcloud users, Home Assistant's entity
+# and auth registry.
 # Checks phrased as prohibitions ("no errors", "file is non-empty") are passed
 # trivially by an empty database, which is exactly how a hollow backup earns a
 # green tick for months.
@@ -55,9 +55,8 @@ if [ -z "$ARCHIVE" ] || [ ! -f "$ARCHIVE" ]; then
 fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/freddy-verify.XXXXXX")"
-# One throwaway per postgres MAJOR version -- see the postgres section.
+# The throwaway postgres, on nextcloud's MAJOR version -- see the postgres section.
 PG16="freddy-verify-pg16-$$"
-PG17="freddy-verify-pg17-$$"
 # A verifier that dies early must NEVER look like a pass. Under `set -e` a
 # probe that cannot even open a database ends the run with status 0 and no
 # verdict, and a caller -- or a systemd timer -- reads that as success. This
@@ -66,7 +65,7 @@ PG17="freddy-verify-pg17-$$"
 VERDICT_REACHED=0
 cleanup() {
   local rc=$?
-  docker rm -f "$PG16" "$PG17" >/dev/null 2>&1 || true
+  docker rm -f "$PG16" >/dev/null 2>&1 || true
   rm -rf "$WORK"
   if [ "$VERDICT_REACHED" -eq 0 ]; then
     bad "rehearsal ENDED EARLY without a verdict (rc=$rc) -- treat as FAILED"
@@ -164,10 +163,15 @@ sqlite_check homeassistant.sqlite "homeassistant" \
 # contents would prove the file parses; only restoring it proves the schema
 # and data actually load.
 #
-# Each dump restores into the MAJOR VERSION it was taken from: nextcloud runs
-# postgres 16, LifeOS runs 17, and pg_restore refuses a dump from a newer
-# pg_dump. One shared throwaway would either fail the LifeOS restore outright
-# or, bumped to 17, rehearse nextcloud against a server it never runs on.
+# The dump restores into the MAJOR VERSION it was taken from: nextcloud runs
+# postgres 16, and pg_restore refuses a dump from a newer pg_dump, so a newer
+# throwaway would rehearse nextcloud against a server it never runs on.
+#
+# LifeOS is NOT rehearsed (2026-10-20). It is in development, Kayla stays on
+# Notion until it is ready, and nothing relies on its data yet. When LifeOS
+# becomes the household's record, bring its checks back from this file's
+# history: imported records, attachments, and every attachment's file in the
+# uploads tar, restored on postgres 17.
 info "--- PostgreSQL restores (throwaway containers)"
 
 # pull_image <image> -- 0 once the image is on this host.
@@ -239,18 +243,6 @@ if start_pg "$PG16" postgres:16-alpine && restore_pg "$PG16" nextcloud_pg.dump n
   pg_assert "$PG16" nextcloud_r nextcloud "SELECT count(*) FROM oc_filecache;" "indexed files" 100
 fi
 
-# LifeOS: 448 records imported from Notion. `attachments` is what the pages
-# embed; its storage keys are cross-checked against the uploads tar below, so
-# the images have to come back too, not merely rows that point at them.
-if start_pg "$PG17" postgres:17-bookworm && restore_pg "$PG17" lifeos_pg.dump lifeos_r; then
-  pg_assert "$PG17" lifeos_r lifeos "SELECT count(*) FROM source_records;" "imported records" 200
-  pg_assert "$PG17" lifeos_r lifeos "SELECT count(*) FROM attachments;" "attachments" 200
-  pg_assert "$PG17" lifeos_r lifeos "SELECT count(*) FROM users;" "users" 1
-  docker exec "$PG17" psql -U rehearsal -d lifeos_r -tAc \
-    "SELECT storage_key FROM attachments WHERE archived_at IS NULL;" \
-    > "$WORK/lifeos_keys.txt" 2>/dev/null || true
-fi
-
 # ---------------------------------------------------------------- tarballs
 # Named paths, not "the tar lists something". Home Assistant's entire entity
 # and auth registry lives in `.storage`, and a tar that skipped dotfiles would
@@ -270,25 +262,6 @@ tar_has photoprism_curated.tar.gz   "photoprism" 'albums/'
 
 LIBMETA="$(tar -tzf "$WORK/library_metadata.tar.gz" 2>/dev/null | grep -c 'metadata\.json' || true)"
 assert "library metadata.json files" "$LIBMETA" -ge 50
-
-# LifeOS uploads are content-addressed (`ab/cd/<sha256>.png`), so every
-# attachment row names exactly one file. Zero missing is only meaningful
-# because the restore above already demanded >= 200 attachment rows; an
-# empty key list is reported as a failure rather than trivially "nothing
-# missing".
-if [ -f "$WORK/lifeos_uploads.tar.gz" ]; then
-  tar -tzf "$WORK/lifeos_uploads.tar.gz" 2>/dev/null | sed 's#^\./##' | grep -v '/$' \
-    | sort > "$WORK/lifeos_files.txt" || true
-  assert "lifeos upload files" "$(wc -l < "$WORK/lifeos_files.txt")" -ge 200
-  if [ -s "$WORK/lifeos_keys.txt" ]; then
-    missing="$(sort "$WORK/lifeos_keys.txt" | sed '/^$/d' | comm -23 - "$WORK/lifeos_files.txt" | wc -l || true)"
-    assert "lifeos attachments whose file is missing" "$missing" = "0"
-  else
-    bad "lifeos: no attachment keys came back from the restore to cross-check"; FAIL=$((FAIL + 1))
-  fi
-else
-  bad "lifeos_uploads.tar.gz: missing from archive"; FAIL=$((FAIL + 1))
-fi
 
 VERDICT_REACHED=1
 echo

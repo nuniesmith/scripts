@@ -66,16 +66,14 @@ reports itself corrupt. Caught by the rehearsal on the first run.
 **The rehearsal asserts positive capability.** `PRAGMA integrity_check` proves
 the file is sound; it does not prove it is the *right* file — a pristine empty
 database passes it. So every check demands named content: 190 library items,
-Kayla's `mediaProgresses` rows, `reconciled_torrents`, LifeOS's imported
-records, `oc_filecache` rows. LifeOS goes one further: every attachment the
-restored database names must have its file in the uploads tar, so the pages'
-images come back rather than rows pointing at nothing. Checks phrased as
-prohibitions are passed trivially by empty data, which is how a hollow backup
-earns a green tick for months.
+Kayla's `mediaProgresses` rows, `reconciled_torrents`, `oc_filecache` rows.
+Checks phrased as prohibitions are passed trivially by empty data, which is
+how a hollow backup earns a green tick for months.
 
 **Postgres dumps restore into the major version they came from.** nextcloud
-runs 16 and LifeOS runs 17; `pg_restore` refuses a dump from a newer
-`pg_dump`, so the rehearsal starts one throwaway per version.
+runs 16, and `pg_restore` refuses a dump from a newer `pg_dump`, so the
+throwaway runs 16 too. LifeOS runs 17 and needs its own when its checks come
+back (below).
 
 **The rehearsal pulls its own image, and says why when it can't.** Docker Hub
 answers a stored login that has expired with `401 Unauthorized` and does not
@@ -86,6 +84,12 @@ went to `/dev/null`. The rehearsal now pulls with the stored login, then
 anonymously (these images are public), then falls back to a copy already on
 the host, and prints Docker's error at each step. `journalctl -u
 docker.service` around the run shows what the daemon saw.
+
+**LifeOS is not rehearsed (2026-10-20).** It is in development and Kayla stays
+on Notion until it is ready, so nothing relies on its data yet. When LifeOS
+becomes the household's record, bring back its checks from git history:
+imported records, attachments, and every attachment's file in the uploads tar,
+so the pages' images come back rather than rows pointing at nothing.
 
 **The newest archive must also be recent.** When the rehearsal picks the
 archive itself, it fails if that archive is older than 36 hours
