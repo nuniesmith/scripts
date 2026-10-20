@@ -59,8 +59,15 @@ run dump_pg nextcloud-postgres nextcloud nextcloud nextcloud_pg
 # LifeOS's 2026-10-09 rebuild renamed its container (lifeos-db-1 -> lifeos-db)
 # and superuser (lifeos_app -> lifeos). The old names failed every run from
 # 2026-10-10 and, by the rule above, withheld EVERY freddy archive for a week.
-run dump_pg lifeos-db lifeos lifeos lifeos_pg
-run dump_tree /srv/lifeos/data/uploads . lifeos_uploads
+#
+# So, since 2026-10-20, LifeOS is BEST-EFFORT while it is in development: Kayla
+# stays on Notion until it is ready and nothing relies on its data yet, and a
+# development change like that rename must not cost Nextcloud, Kayla's books
+# and Home Assistant their backup. A LifeOS failure is reported and the archive
+# goes ahead without it. When LifeOS becomes the household's record, switch both
+# lines back to `run` and bring back its rehearsal checks.
+best_effort dump_pg lifeos-db lifeos lifeos lifeos_pg
+best_effort dump_tree /srv/lifeos/data/uploads . lifeos_uploads
 
 # PhotoPrism runs on SQLite since freddy#15 -- it never supported postgres, which
 # is why that database had zero tables. index.db IS the live index now: every

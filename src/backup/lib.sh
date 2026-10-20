@@ -5,7 +5,7 @@
 # promotion rule is a second thing to get wrong quietly.
 #
 # Callers set: HOST, DEST, KEEP, PREFIX, DRY_RUN
-# Callers use: dump_pg, dump_sqlite, dump_tree, dump_host_files, run, finish
+# Callers use: dump_pg, dump_sqlite, dump_tree, dump_host_files, run, best_effort, finish
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()  { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -25,6 +25,9 @@ EMPTY_TAR_BYTES=60
 
 FAILED=0
 run() { "$@" || FAILED=$((FAILED + 1)); }
+# For a source nothing relies on yet: its failure is reported, and the archive
+# still goes ahead without it. Everything else goes through `run`, fail-closed.
+best_effort() { "$@" || warn "best-effort source failed, archiving without it: $*"; }
 remote() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "$@"; }
 
 # A dump that fails must not leave a plausible-looking short file behind.
