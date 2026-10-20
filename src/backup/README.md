@@ -77,6 +77,16 @@ earns a green tick for months.
 runs 16 and LifeOS runs 17; `pg_restore` refuses a dump from a newer
 `pg_dump`, so the rehearsal starts one throwaway per version.
 
+**The rehearsal pulls its own image, and says why when it can't.** Docker Hub
+answers a stored login that has expired with `401 Unauthorized` and does not
+fall back to an anonymous pull. oryx's login had lapsed by 2026-10-11, and the
+rehearsals of 10-11 and 10-18 lost their postgres restores to it while
+reporting only "throwaway … never came up", because `docker run`'s own error
+went to `/dev/null`. The rehearsal now pulls with the stored login, then
+anonymously (these images are public), then falls back to a copy already on
+the host, and prints Docker's error at each step. `journalctl -u
+docker.service` around the run shows what the daemon saw.
+
 **The newest archive must also be recent.** When the rehearsal picks the
 archive itself, it fails if that archive is older than 36 hours
 (`VERIFY_MAX_AGE_HOURS`). See the next section for why.

@@ -169,17 +169,46 @@ sqlite_check homeassistant.sqlite "homeassistant" \
 # pg_dump. One shared throwaway would either fail the LifeOS restore outright
 # or, bumped to 17, rehearse nextcloud against a server it never runs on.
 info "--- PostgreSQL restores (throwaway containers)"
+
+# pull_image <image> -- 0 once the image is on this host.
+# Docker Hub answers a stored login that has EXPIRED with 401 and does not fall
+# back to an anonymous pull, though these public images need no login at all.
+# oryx's login lapsed by 2026-10-11, and the next two Sunday rehearsals lost
+# their postgres restores to it while reporting only "never came up": the pull
+# error went to /dev/null with the rest of `docker run`'s output. So: the stored
+# login first (its pull limit is higher), then anonymously, then a copy already
+# on this host -- and say which, so a lapsed login shows up here.
+pull_image() {
+  local image="$1" err
+  err="$(docker pull -q "$image" 2>&1)" && return 0
+  warn "pulling $image with the stored login failed: $(tail -n 1 <<<"$err")"
+  mkdir -p "$WORK/docker-anon"
+  if err="$(DOCKER_CONFIG="$WORK/docker-anon" docker pull -q "$image" 2>&1)"; then
+    warn "pulled $image anonymously instead -- run \`docker login\` to refresh the stored login"
+    return 0
+  fi
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    warn "pulling $image anonymously failed too ($(tail -n 1 <<<"$err")); using the copy on this host"
+    return 0
+  fi
+  bad "cannot get $image: $(tail -n 1 <<<"$err")"; FAIL=$((FAIL + 1)); return 1
+}
+
 start_pg() {  # start_pg <container> <image> -- 0 once it accepts connections
-  local name="$1" image="$2"
+  local name="$1" image="$2" err
+  pull_image "$image" || return 1
   docker rm -f "$name" >/dev/null 2>&1 || true
-  docker run -d --name "$name" -e POSTGRES_PASSWORD=rehearsal \
-    -e POSTGRES_USER=rehearsal -e POSTGRES_DB=rehearsal "$image" >/dev/null 2>&1 || true
+  if ! err="$(docker run -d --name "$name" -e POSTGRES_PASSWORD=rehearsal \
+      -e POSTGRES_USER=rehearsal -e POSTGRES_DB=rehearsal "$image" 2>&1)"; then
+    bad "throwaway $image did not start: $(tail -n 1 <<<"$err")"; FAIL=$((FAIL + 1)); return 1
+  fi
   for _ in $(seq 1 45); do
     docker exec "$name" pg_isready -U rehearsal >/dev/null 2>&1 && break
     sleep 1
   done
   if ! docker exec "$name" pg_isready -U rehearsal >/dev/null 2>&1; then
-    bad "throwaway $image never came up"; FAIL=$((FAIL + 1)); return 1
+    bad "throwaway $image never came up; its last log line: $(docker logs --tail 1 "$name" 2>&1 | tail -n 1)"
+    FAIL=$((FAIL + 1)); return 1
   fi
   ok "throwaway $image ready"
 }
