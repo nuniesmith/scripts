@@ -85,11 +85,16 @@ anonymously (these images are public), then falls back to a copy already on
 the host, and prints Docker's error at each step. `journalctl -u
 docker.service` around the run shows what the daemon saw.
 
-**LifeOS is not rehearsed (2026-10-20).** It is in development and Kayla stays
-on Notion until it is ready, so nothing relies on its data yet. When LifeOS
-becomes the household's record, bring back its checks from git history:
-imported records, attachments, and every attachment's file in the uploads tar,
-so the pages' images come back rather than rows pointing at nothing.
+**LifeOS is best-effort (2026-10-20).** It is in development and Kayla stays on
+Notion until it is ready, so nothing relies on its data yet. Its dump and
+uploads are still taken nightly, but through `best_effort`: a failure is
+reported and the archive goes ahead without them, because a development change
+(the 2026-10-09 container rename) withheld every freddy archive for a week.
+The rehearsal no longer restores LifeOS. When LifeOS becomes the household's
+record, switch both sources back to `run` and bring back its checks from git
+history: imported records, attachments, and every attachment's file in the
+uploads tar, so the pages' images come back rather than rows pointing at
+nothing.
 
 **The newest archive must also be recent.** When the rehearsal picks the
 archive itself, it fails if that archive is older than 36 hours
