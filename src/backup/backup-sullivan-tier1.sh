@@ -16,6 +16,8 @@
 #   plex library.db          watch history, playlists, collections, ratings --
 #                            unrecoverable, and the one users notice
 #   recyclarr YAML           the custom-format sync config
+#   parlour_pg               parlour's users, libraries and listening
+#                            progress (test instance alongside emby)
 #   compose + .env           how the whole stack is assembled
 #
 # 18TB of media is NOT covered and is not meant to be. It is re-acquirable;
@@ -80,6 +82,7 @@ run dump_tree sullivan_plex_data "$PLEX_APP" plex_prefs \
 run dump_sqlite sullivan_mealie_data mealie.db     mealie
 run dump_sqlite sullivan_grocy_data  data/grocy.db grocy
 run dump_pg     wiki-postgres wikijs wiki wiki_pg
+run dump_pg     parlour-db    parlour parlour parlour_pg
 
 # --- config trees -------------------------------------------------------
 # qBittorrent's BT_backup holds the .fastresume for every active torrent.
